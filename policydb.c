@@ -256,7 +256,7 @@ bool doesPolicyAllow(const char *processName, const char *destName, int tag) {
     struct stat dbStat;
 
     LOGW("phornyac: doesPolicyAllow(): entered");
-    LOGW("phornyac: doesPolicyAllow(): processName=%s, destName=%s, tag=%d",
+    LOGW("phornyac: doesPolicyAllow(): processName=%s, destName=%s, tag=0x%X",
             processName, destName, tag);
 
     /* Use snprintf() to generate db filename? */
