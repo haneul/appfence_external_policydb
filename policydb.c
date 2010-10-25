@@ -22,15 +22,32 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sqlite3.h>
-
-/* Need to define LOG_TAG before #including file: */
-#define LOG_TAG "policydb"
 #include <cutils/log.h>
+#include <policy_global.h>
+
+#ifdef LOG_TAG
+#undef LOG_TAG
+#define LOG_TAG "policydb"
+#endif
+
+/**
+ * From dalvik/vm/Common.h:
+ * The <stdbool.h> definition uses _Bool, a type known to the compiler.
+ */
+#ifdef HAVE_STDBOOL_H
+# include <stdbool.h>   /* C99 */
+#else
+# ifndef __bool_true_false_are_defined
+  typedef enum { false=0, true=!false } bool;
+# define __bool_true_false_are_defined 1
+# endif
+#endif
 
 /**
  * Persistent variables for storing SQLite database connection, etc.
  */
-const char *dbFilename = ":memory:";
+const char *dbFilename = "/data/data/com.android.settings/shared_prefs/policy.db";
+//const char *dbFilename = ":memory:";
 //const char *dbFilename = "/data/data/com.android.browser/policy.db";
 //const char *dbFilename = "/data/data/com.android.browser/databases/policy.db";
   //"Once created, the SQLite database is stored in the
@@ -44,14 +61,14 @@ const char *dbFilename = ":memory:";
   //Solution: need to move this code to a _centralized_ location!
   //  Context: needs to be "system" or "root" user, not "app_5", etc.
 const char *dbTableName = "policy";
-static sqlite3 *policyDb = NULL;
-//sqlite3 *policyDb = NULL;
-  //XXX: make this static???
+sqlite3 *policyDb = NULL;
+#if 0
 static bool policyHasChanged = false;
   //XXX: make this static? Yes: only the first app that gets to it needs
   //  to update the database
   //  But need to add a LOCK!!! XXX
-static bool defaultAllow = true;        //XXX: set this from global prefs!
+#endif
+static bool defaultAllow = true;  //XXX: set this from global prefs!
 sqlite3_stmt *queryStmt = NULL;
   //Ok to not be static: holds the current/previous query statement for
   //  each app?
@@ -430,6 +447,7 @@ typedef unsigned int        u4;
         LOGW("phornyac: doesPolicyAllow(): policyDb was not NULL");
     }
 
+#if 0
     /**
      * Check if the policy has changed, and if so, reload the database...
      * The policyHasChanged variable should be changed when the global policy
@@ -449,6 +467,7 @@ typedef unsigned int        u4;
     } else {
         LOGW("phornyac: doesPolicyAllow(): policyHasChanged is false");
     }
+#endif
 
     /**
      * Construct a query string to get all of the records matching the current
@@ -548,5 +567,31 @@ finalize_and_out:
       //XXX: optimize this function to re-use queryStmt??
 out:
     return retval;
+}
+
+int add_policydb_entry(policy_entry *entry) {
+    LOGW("phornyac: add_policydb_entry(): not implemented yet! "
+            "...returning -1");
+    return -1;
+}
+
+int remove_policydb_entries(policy_entry *entry) {
+    LOGW("phornyac: remove_policydb_entries(): not implemented yet! "
+            "...returning -1");
+    return -1;
+}
+
+int query_policydb(policy_entry *entry) {
+    LOGW("phornyac: query_policydb(): not implemented yet!");
+    int taint = entry->taint_tag;
+
+    if (taint) {
+        LOGW("phornyac: query_policydb(): taint is nonzero, so "
+                "returning 1 for now");
+        return 1;
+    }
+    LOGW("phornyac: query_policydb(): taint is zero, so skipping db, "
+            "just returning 0 for now");
+    return 0;
 }
 
