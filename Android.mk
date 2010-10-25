@@ -5,9 +5,7 @@ LOCAL_C_INCLUDES := \
     external/sqlite/dist
 
 LOCAL_SRC_FILES:= \
-	policydb.c \
-	policy_client.c \
-    policy_global.c
+	policydb.c
 
 LOCAL_MODULE:= libpolicydb
 
@@ -18,4 +16,3 @@ LOCAL_SHARED_LIBRARIES := \
 include $(BUILD_SHARED_LIBRARY)
 #include $(BUILD_STATIC_LIBRARY)
 #LOCAL_PRELINK_MODULE := true
-  #???
