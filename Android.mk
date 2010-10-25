@@ -1,11 +1,13 @@
 LOCAL_PATH:= $(call my-dir)
 include $(CLEAR_VARS)
 
-LOCAL_SRC_FILES:= \
-	policydb.c
-
 LOCAL_C_INCLUDES := \
     external/sqlite/dist
+
+LOCAL_SRC_FILES:= \
+	policydb.c \
+	policy_client.c \
+    policy_global.c
 
 LOCAL_MODULE:= libpolicydb
 

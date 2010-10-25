@@ -15,10 +15,54 @@
  */
 
 #include "policydb.h"
+#include <errno.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sqlite3.h>
 
 /* Need to define LOG_TAG before #including file: */
 #define LOG_TAG "policydb"
 #include <cutils/log.h>
+
+/**
+ * Persistent variables for storing SQLite database connection, etc.
+ */
+const char *dbFilename = ":memory:";
+//const char *dbFilename = "/data/data/com.android.browser/policy.db";
+//const char *dbFilename = "/data/data/com.android.browser/databases/policy.db";
+  //"Once created, the SQLite database is stored in the
+  // /data/data/<package_name>/databases folder of an Android device"
+  //"/data/policyDb" doesn't work, just creates an empty file
+  //  neither does "/data/data/com.android.settings/shared_prefs/policy.db"
+  //Any "scratch" locations where all apps have write access? Not really...
+  //  /sqlite_stmt_journals
+  //Shouldn't be any locations where all apps have write access, because
+  //otherwise apps could use it for unprotected IPC.
+  //Solution: need to move this code to a _centralized_ location!
+  //  Context: needs to be "system" or "root" user, not "app_5", etc.
+const char *dbTableName = "policy";
+static sqlite3 *policyDb = NULL;
+//sqlite3 *policyDb = NULL;
+  //XXX: make this static???
+static bool policyHasChanged = false;
+  //XXX: make this static? Yes: only the first app that gets to it needs
+  //  to update the database
+  //  But need to add a LOCK!!! XXX
+static bool defaultAllow = true;        //XXX: set this from global prefs!
+sqlite3_stmt *queryStmt = NULL;
+  //Ok to not be static: holds the current/previous query statement for
+  //  each app?
+
+/* These constants define table structure/columns: */
+enum dbColumns {    //must start at 0 for indexing into database!
+    SRC = 0,        //SQLITE_TEXT
+    DEST,           //SQLITE_TEXT
+    TAINT,          //SQLITE_INTEGER
+    COLUMNS         //must always be last!!!
+};
 
 /**
  * Constructs a query string that gets the records/rows of the database matching
@@ -505,5 +549,4 @@ finalize_and_out:
 out:
     return retval;
 }
-
 
