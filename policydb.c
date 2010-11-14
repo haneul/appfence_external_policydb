@@ -18,12 +18,17 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sqlite3.h>
 #include <cutils/log.h>
 #include <policy_global.h>
+
+/* Enable this to run some debugging code. The debugging code should have no
+ * side-effects at all anyway though. */
+#define TESTCODE
 
 #ifdef LOG_TAG
 #undef LOG_TAG
@@ -46,47 +51,55 @@
 /**
  * Persistent variables for storing SQLite database connection, etc.
  */
-const char *dbFilename = "/data/data/com.android.settings/shared_prefs/policy.db";
-//const char *dbFilename = ":memory:";
-//const char *dbFilename = "/data/data/com.android.browser/policy.db";
-//const char *dbFilename = "/data/data/com.android.browser/databases/policy.db";
+const char *db_filename = "/data/data/com.android.settings/policy.db";
+//const char *db_filename = ":memory:";
+//const char *db_filename = "/data/data/com.android.browser/policy.db";
+//const char *db_filename = "/data/data/com.android.browser/databases/policy.db";
   //"Once created, the SQLite database is stored in the
   // /data/data/<package_name>/databases folder of an Android device"
   //"/data/policyDb" doesn't work, just creates an empty file
   //  neither does "/data/data/com.android.settings/shared_prefs/policy.db"
   //Any "scratch" locations where all apps have write access? Not really...
   //  /sqlite_stmt_journals
-  //Shouldn't be any locations where all apps have write access, because
-  //otherwise apps could use it for unprotected IPC.
-  //Solution: need to move this code to a _centralized_ location!
-  //  Context: needs to be "system" or "root" user, not "app_5", etc.
-const char *dbTableName = "policy";
-sqlite3 *policyDb = NULL;
-#if 0
-static bool policyHasChanged = false;
-  //XXX: make this static? Yes: only the first app that gets to it needs
-  //  to update the database
-  //  But need to add a LOCK!!! XXX
-#endif
-static bool defaultAllow = true;  //XXX: set this from global prefs!
-sqlite3_stmt *queryStmt = NULL;
+sqlite3 *db_ptr = NULL;
+static bool db_default_allow = true;  //XXX: set this from global prefs!
+sqlite3_stmt *db_query_stmt = NULL;
   //Ok to not be static: holds the current/previous query statement for
   //  each app?
 
-/* These constants define table structure/columns: */
-enum dbColumns {    //must start at 0 for indexing into database!
+/**
+ * These constants define table structure/columns; all of the dbXyzs
+ * should match each other!! (It's too damn hard to dynamically
+ * construct the create table string, etc. in C)
+ * Used by create_db_table() to create the database table.
+ */
+const char *db_tablename = "policy";
+enum dbCols {    //must start at 0 for indexing into database!
     SRC = 0,        //SQLITE_TEXT
     DEST,           //SQLITE_TEXT
     TAINT,          //SQLITE_INTEGER
     COLUMNS         //must always be last!!!
 };
+const char *db_col_names[] = {
+    "src",
+    "dest",
+    "taint",
+};
+const char *db_col_types[] = {
+    "TEXT",
+    "TEXT",
+    "INTEGER",
+};
+const char *db_createstring =
+    "CREATE TABLE policy (src TEXT, dest TEXT, taint INTEGER)";
+      //make sure string after TABLE is db_tablename
 
 /**
  * Constructs a query string that gets the records/rows of the database matching
  * the given source application name. Returns pointer to a newly-allocated string
  * (which should be freed by the caller) on success, or returns NULL on failure.
  */
-char *constructQueryString(const char *source) {
+char *construct_querystring(const char *source) {
     int queryLen;
     char *queryString;
     const char *select = "SELECT";
@@ -94,7 +107,7 @@ char *constructQueryString(const char *source) {
     const char *from = "FROM";
     const char *where = "WHERE";
  
-    LOGW("phornyac: constructQueryString(): entered");
+    LOGW("phornyac: construct_querystring(): entered");
     /**
      * Construct the SQL query string:
      *   SELECT *
@@ -128,18 +141,18 @@ char *constructQueryString(const char *source) {
      */
     queryLen = strlen(select) + strlen(" ") + strlen(columns) + 
         strlen(" ") + strlen(from) +
-        strlen(" ") + strlen(dbTableName) + strlen(" ") + strlen(where) +
+        strlen(" ") + strlen(db_tablename) + strlen(" ") + strlen(where) +
         strlen(" src=\'") + strlen(source) + strlen("\' OR src=\'*\'") + 1;
     queryString = (char *)malloc(queryLen * sizeof(char));
     snprintf(queryString, queryLen, "%s %s %s %s %s src=\'%s\' OR src=\'*\'",
-            select, columns, from, dbTableName, where, source);
-    LOGW("phornyac: constructQueryString(): queryLen=%d, queryString=%s",
+            select, columns, from, db_tablename, where, source);
+    LOGW("phornyac: construct_querystring(): queryLen=%d, queryString=%s",
             queryLen, queryString);
     return queryString;
 }
 
 /* Prints the current database row. */
-void printRow(sqlite3_stmt *stmt){
+void print_row(sqlite3_stmt *stmt){
     const unsigned char *dbSrc;
     const unsigned char *dbDest;
     int dbTaint;
@@ -152,7 +165,7 @@ void printRow(sqlite3_stmt *stmt){
     dbDest = sqlite3_column_text(stmt, DEST);
     dbTaint = sqlite3_column_int(stmt, TAINT);
  
-    LOGW("phornyac: printRow(): dbSrc=%s, dbDest=%s, dbTaint=0x%X",
+    LOGW("phornyac: print_row(): dbSrc=%s, dbDest=%s, dbTaint=0x%X",
             dbSrc, dbDest, dbTaint);
 }
 
@@ -162,15 +175,15 @@ void printRow(sqlite3_stmt *stmt){
  * XXX: enhance this function to consider subnets, partial IP addresses /
  *   hostnames, etc.!
  */
-bool destinationMatch(const char *curDest, const char *dbDest) {
-    LOGW("phornyac: destinationMatch: curDest=%s, dbDest=%s",
+bool destination_match(const char *curDest, const char *dbDest) {
+    LOGW("phornyac: destination_match: curDest=%s, dbDest=%s",
             curDest, dbDest);
     
     if ((strcmp("*", dbDest) == 0) || (strcmp(curDest, dbDest) == 0)) {
-        LOGW("phornyac: destinationMatch: returning true");
+        LOGW("phornyac: destination_match: returning true");
         return true;
     }
-    LOGW("phornyac: destinationMatch: returning false");
+    LOGW("phornyac: destination_match: returning false");
     return false;
 }
 
@@ -178,14 +191,14 @@ bool destinationMatch(const char *curDest, const char *dbDest) {
  * Returns true if the two taint tags "match," i.e. if they have any of the same
  * bits set.
  */
-bool taintMatch(int curTaint, int dbTaint) {
-    LOGW("phornyac: taintMatch: curTaint=0x%X, dbTaint=0x%X",
+bool taint_match(int curTaint, int dbTaint) {
+    LOGW("phornyac: taint_match: curTaint=0x%X, dbTaint=0x%X",
             curTaint, dbTaint);
     if (curTaint & dbTaint) {
-        LOGW("phornyac: taintMatch: returning true");
+        LOGW("phornyac: taint_match: returning true");
         return true;
     }
-    LOGW("phornyac: taintMatch: returning false");
+    LOGW("phornyac: taint_match: returning false");
     return false;
 }
 
@@ -195,29 +208,29 @@ bool taintMatch(int curTaint, int dbTaint) {
  * then this function should return true if the destination server and taint
  * of the data about to be transmitted BOTH match one of the records.
  */
-bool checkRowForMatch(sqlite3_stmt *queryStmt, const char *dest, int taint) {
+bool check_row_for_match(sqlite3_stmt *db_query_stmt, const char *dest, int taint) {
     const unsigned char *dbDest;
     int dbTaint;
 
-    LOGW("phornyac: checkRowForMatch(): entered");
+    LOGW("phornyac: check_row_for_match(): entered");
 
     /**
      * Get the values from the destination and taint tag columns:
      * http://sqlite.org/c3ref/column_blob.html
      */
-    dbDest = sqlite3_column_text(queryStmt, DEST);
+    dbDest = sqlite3_column_text(db_query_stmt, DEST);
     if (dbDest == NULL) {
-        LOGW("phornyac: checkRowForMatch(): dbDest got NULL, returning false!");
+        LOGW("phornyac: check_row_for_match(): dbDest got NULL, returning false!");
         return false;
     }
-    dbTaint = sqlite3_column_int(queryStmt, TAINT);
+    dbTaint = sqlite3_column_int(db_query_stmt, TAINT);
 
     /* Return true if BOTH the destinations and the taints match: */
-    if (destinationMatch(dest, (const char *)dbDest) && taintMatch(taint, dbTaint)) {
-        LOGW("phornyac: checkRowForMatch(): returning true");
+    if (destination_match(dest, (const char *)dbDest) && taint_match(taint, dbTaint)) {
+        LOGW("phornyac: check_row_for_match(): returning true");
         return true;
     }
-    LOGW("phornyac: checkRowForMatch(): returning false");
+    LOGW("phornyac: check_row_for_match(): returning false");
     return false;
 }
 
@@ -225,7 +238,7 @@ bool checkRowForMatch(sqlite3_stmt *queryStmt, const char *dest, int taint) {
  * Adds the given (source, dest, taint) triple to the database table.
  * Returns 0 on success, negative on error.
  */
-int insertDbRow(sqlite3 *db, const char *tableName, const char *source,
+int insert_row(sqlite3 *db, const char *tableName, const char *source,
         const char *dest, int taint) {
     sqlite3_stmt *insertStmt;
     int len;
@@ -234,7 +247,7 @@ int insertDbRow(sqlite3 *db, const char *tableName, const char *source,
     char taintString[32];
       //2^64 = 18446744073709551616, which is 20 digits
 
-    LOGW("phornyac: insertDbRow(): entered");
+    LOGW("phornyac: insert_row(): entered");
 
     /**
      * Construct the INSERT string:
@@ -247,7 +260,7 @@ int insertDbRow(sqlite3 *db, const char *tableName, const char *source,
     /* Convert taint int to string: */
     snprintf(taintString, 32, "%d", taint);
       //Should be a decimal integer going into database, not hex!
-    LOGW("phornyac: insertDbRow(): calculated taintString=%s, len=%d",
+    LOGW("phornyac: insert_row(): calculated taintString=%s, len=%d",
             taintString, strlen(taintString));
     len = strlen(insertInto) + strlen(" ") + strlen(tableName) + 
         strlen(" ") + strlen(values) + strlen(" (\'") + strlen(source) +
@@ -257,43 +270,43 @@ int insertDbRow(sqlite3 *db, const char *tableName, const char *source,
     /* Must use quotes around column values inside () ! */
     snprintf(insertString, len, "%s %s %s (\'%s\', \'%s\', \'%s\')",
             insertInto, tableName, values, source, dest, taintString);
-    LOGW("phornyac: insertDbRow(): constructed insertString=%s", insertString);
+    LOGW("phornyac: insert_row(): constructed insertString=%s", insertString);
 
     /**
      * Prepare an SQLite statement with the INSERT string:
      * See http://sqlite.org/c3ref/prepare.html
      */
-    LOGW("phornyac: insertDbRow(): calling sqlite3_prepare_v2()");
+    LOGW("phornyac: insert_row(): calling sqlite3_prepare_v2()");
     err = sqlite3_prepare_v2(db, insertString, len, &insertStmt, NULL);
     free(insertString);
     if (err != SQLITE_OK) {
-        LOGW("phornyac: insertDbRow(): sqlite3_prepare_v2() returned "
+        LOGW("phornyac: insert_row(): sqlite3_prepare_v2() returned "
                 "error: %s", sqlite3_errmsg(db));
-        LOGW("phornyac: insertDbRow(): returning -1 due to errors");
+        LOGW("phornyac: insert_row(): returning -1 due to errors");
         return -1;
     }
 
     /**
      * Execute the prepared statement:
      */
-    LOGW("phornyac: insertDbRow(): calling sqlite3_step() to execute "
+    LOGW("phornyac: insert_row(): calling sqlite3_step() to execute "
             "INSERT statement");
     err = sqlite3_step(insertStmt);
     if (err != SQLITE_DONE) {
-        LOGW("phornyac: insertDbRow(): sqlite3_step() returned "
+        LOGW("phornyac: insert_row(): sqlite3_step() returned "
                 "error: %s", sqlite3_errmsg(db));
-        LOGW("phornyac: insertDbRow(): returning -1 due to errors");
+        LOGW("phornyac: insert_row(): returning -1 due to errors");
         sqlite3_finalize(insertStmt);  //ignore return value
         return -1;
     }
  
     /* Finalize and return: */
-    LOGW("phornyac: insertDbRow(): INSERT succeeded, finalizing and returning");
+    LOGW("phornyac: insert_row(): INSERT succeeded, finalizing and returning");
     err = sqlite3_finalize(insertStmt);
     if (err != SQLITE_OK) {
-        LOGW("phornyac: insertDbRow(): sqlite3_finalize() returned "
+        LOGW("phornyac: insert_row(): sqlite3_finalize() returned "
                 "error: %s", sqlite3_errmsg(db));
-        LOGW("phornyac: insertDbRow(): returning -1 due to errors");
+        LOGW("phornyac: insert_row(): returning -1 due to errors");
         return -1;
     }
     return 0;
@@ -327,13 +340,13 @@ bool doesPolicyAllow(const char *processName, const char *destName, int tag) {
      * Initialize the database connection if not already done:
      * http://sqlite.org/c3ref/open.html
      */
-    if (policyDb == NULL) {
-        LOGW("phornyac: doesPolicyAllow(): policyDb is NULL, initializing");
+    if (db_ptr == NULL) {
+        LOGW("phornyac: doesPolicyAllow(): db_ptr is NULL, initializing");
 
         //DEBUG (XXX: remove this):
-        LOGW("phornyac: doesPolicyAllow(): calling stat for dbFilename=%s",
-                dbFilename);
-        err = stat(dbFilename, &dbStat);
+        LOGW("phornyac: doesPolicyAllow(): calling stat for db_filename=%s",
+                db_filename);
+        err = stat(db_filename, &dbStat);
         if (err) {
             if (errno == ENOENT) {
                 LOGW("phornyac: doesPolicyAllow(): stat returned errno=ENOENT, "
@@ -351,27 +364,27 @@ bool doesPolicyAllow(const char *processName, const char *destName, int tag) {
         //Right now, it's instantiated once per application!
         //  Figure out a more central place to put it...
         LOGW("phornyac: doesPolicyAllow(): calling sqlite3_open(%s)",
-                dbFilename);
+                db_filename);
         /**
          * The "standard" version of sqlite3_open() opens a database for reading
          * and writing, and creates it if it does not exist.
          * http://sqlite.org/c3ref/open.html
          */
-        err = sqlite3_open(dbFilename, &policyDb);
-        if ((err != SQLITE_OK) || (policyDb == NULL)) {
-            if (policyDb == NULL) {
+        err = sqlite3_open(db_filename, &db_ptr);
+        if ((err != SQLITE_OK) || (db_ptr == NULL)) {
+            if (db_ptr == NULL) {
                 LOGW("phornyac: doesPolicyAllow(): sqlite3_open() returned "
-                        "NULL policyDb!");
+                        "NULL db_ptr!");
             }
             LOGW("phornyac: doesPolicyAllow(): sqlite3_open() error message: "
-                    "%s", sqlite3_errmsg(policyDb));
-            policyDb = NULL;  /* set back to NULL so we'll retry after error */
+                    "%s", sqlite3_errmsg(db_ptr));
+            db_ptr = NULL;  /* set back to NULL so we'll retry after error */
             LOGW("phornyac: doesPolicyAllow(): returning false due to errors");
             retval = false;
             goto out;
         }
-        LOGW("phornyac: doesPolicyAllow(): sqlite3_open() succeeded, policyDb=%p",
-                policyDb);
+        LOGW("phornyac: doesPolicyAllow(): sqlite3_open() succeeded, db_ptr=%p",
+                db_ptr);
         /* XXX: We never close the database connection: is this ok? */
 
         /**
@@ -379,10 +392,10 @@ bool doesPolicyAllow(const char *processName, const char *destName, int tag) {
          * See http://sqlite.org/lang_createtable.html
          * See http://sqlite.org/c3ref/exec.html
          */
-        LOGW("phornyac: doesPolicyAllow(): creating table \"%s\"", dbTableName);
+        LOGW("phornyac: doesPolicyAllow(): creating table \"%s\"", db_tablename);
         //XXX: un-hard-code this!
         //XXX: put this in a separate function!
-        err = sqlite3_exec(policyDb, "CREATE TABLE policy (src TEXT, dest TEXT, taint INTEGER)",
+        err = sqlite3_exec(db_ptr, "CREATE TABLE policy (src TEXT, dest TEXT, taint INTEGER)",
                 NULL, NULL, &errmsg);
         LOGW("phornyac: doesPolicyAllow(): sqlite3_exec() returned");
         if (err) {
@@ -402,17 +415,17 @@ bool doesPolicyAllow(const char *processName, const char *destName, int tag) {
                  * For some reason, when I open browser, then open maps app, I get this
                  * error from maps:
                  *   "W/dalvikvm(  475): phornyac: doesPolicyAllow(): sqlite3_exec(CREATE
-                 *    TABLE) returned error "table policy already exists", so   returning
+                 *    TABLE) returned error "table policy already exists", so returning
                  *    false
                  * Don't get the error when using in-memory database though
-                 *   (dbFilename=":memory:")
+                 *   (db_filename=":memory:")
                  */
                 sqlite3_free(errmsg);
             } else {
                 LOGW("phornyac: doesPolicyAllow(): sqlite3_exec(CREATE TABLE) "
                         "returned error, errmsg=NULL");
             }
-            policyDb = NULL;  /* set back to NULL so we'll retry after error */
+            db_ptr = NULL;  /* set back to NULL so we'll retry after error */
             retval = false;
             goto out;
         }
@@ -429,22 +442,22 @@ typedef unsigned int        u4;
 #endif
 //Copied from dalvik/vm/interp/Taint.h:
 #define TAINT_LOCATION_GPS  ((u4)0x00000010) /* GPS Location */
-        err = insertDbRow(policyDb, dbTableName, "*", "*", TAINT_LOCATION_GPS);
-        err |= insertDbRow(policyDb, dbTableName, "com.android.browser",
+        err = insert_row(db_ptr, db_tablename, "*", "*", TAINT_LOCATION_GPS);
+        err |= insert_row(db_ptr, db_tablename, "com.android.browser",
                 "*", 255);
-        err |= insertDbRow(policyDb, dbTableName, "com.android.browser",
+        err |= insert_row(db_ptr, db_tablename, "com.android.browser",
                 "72.14.*", 255);  //255 = 0xff
         //(DEBUG: Get all rows in a table: SELECT * FROM Persons)
         if (err) {
-            LOGW("phornyac: doesPolicyAllow(): insertDbRow() returned error, "
+            LOGW("phornyac: doesPolicyAllow(): insert_row() returned error, "
                     "so returning false");
-            policyDb = NULL;  /* set back to NULL so we'll retry after error */
+            db_ptr = NULL;  /* set back to NULL so we'll retry after error */
             retval = false;
             goto out;
         }
 
     } else {
-        LOGW("phornyac: doesPolicyAllow(): policyDb was not NULL");
+        LOGW("phornyac: doesPolicyAllow(): db_ptr was not NULL");
     }
 
 #if 0
@@ -473,14 +486,14 @@ typedef unsigned int        u4;
      * Construct a query string to get all of the records matching the current
      * application name: 
      */
-    queryString = constructQueryString(processName);  /* Don't forget to free! */
+    queryString = construct_querystring(processName);  /* Don't forget to free! */
     if (queryString == NULL) {
-        LOGW("phornyac: doesPolicyAllow(): constructQueryString returned NULL, "
+        LOGW("phornyac: doesPolicyAllow(): construct_querystring returned NULL, "
                 "so returning false");
         retval = false;
         goto out;
     }
-    LOGW("phornyac: doesPolicyAllow(): constructQueryString returned string %s",
+    LOGW("phornyac: doesPolicyAllow(): construct_querystring returned string %s",
                 queryString);
     queryLen = strlen(queryString);
 
@@ -489,12 +502,12 @@ typedef unsigned int        u4;
      * http://sqlite.org/c3ref/prepare.html
      */
     LOGW("phornyac: doesPolicyAllow(): calling sqlite3_prepare_v2()");
-    err = sqlite3_prepare_v2(policyDb, queryString, queryLen + 1,
-            &queryStmt, NULL);
+    err = sqlite3_prepare_v2(db_ptr, queryString, queryLen + 1,
+            &db_query_stmt, NULL);
     free(queryString);
     if (err != SQLITE_OK) {
         LOGW("phornyac: doesPolicyAllow(): sqlite3_prepare_v2() returned "
-                "error: %s", sqlite3_errmsg(policyDb));
+                "error: %s", sqlite3_errmsg(db_ptr));
         LOGW("phornyac: doesPolicyAllow(): returning false due to errors");
         retval = false;
         goto out;
@@ -502,7 +515,7 @@ typedef unsigned int        u4;
 
     /**
      * Evaluate the SQL statement: call sqlite3_step() to get the next matching
-     * record, then call checkRowForMatch() to see if the record matches the
+     * record, then call check_row_for_match() to see if the record matches the
      * current destination server and taint tag. Repeat until a match is found,
      * or until the statement evaluation is complete and sqlite3_step() returns
      * SQLITE_DONE.
@@ -516,18 +529,18 @@ typedef unsigned int        u4;
     err = SQLITE_OK;
     while (err != SQLITE_DONE) {
         LOGW("phornyac: doesPolicyAllow(): calling sqlite3_step()");
-        err = sqlite3_step(queryStmt);
+        err = sqlite3_step(db_query_stmt);
 
         if (err == SQLITE_ROW) {
-            printRow(queryStmt);
-            match = checkRowForMatch(queryStmt, destName, tag);
+            print_row(db_query_stmt);
+            match = check_row_for_match(db_query_stmt, destName, tag);
             if (match) {
                 /**
                  * If the default policy is to allow data transmission, then
                  * when there is a matching record in the policy database we
                  * should block the transmission, and vice-versa:
                  */
-                if (defaultAllow) {
+                if (db_default_allow) {
                     LOGW("phornyac: doesPolicyAllow(): found a match, setting "
                             "retval=false");
                     retval = false;
@@ -540,7 +553,7 @@ typedef unsigned int        u4;
             } 
         } else if (err != SQLITE_DONE) {
             LOGW("phornyac: doesPolicyAllow(): sqlite3_step() returned "
-                    "error: %s", sqlite3_errmsg(policyDb));
+                    "error: %s", sqlite3_errmsg(db_ptr));
             LOGW("phornyac: doesPolicyAllow(): returning false due to errors");
             retval = false;
             goto finalize_and_out;
@@ -552,7 +565,7 @@ typedef unsigned int        u4;
      * return true if the default policy is to allow transmission and false
      * if the default policy is to deny transmission:
      */
-    if (defaultAllow) {
+    if (db_default_allow) {
         LOGW("phornyac: doesPolicyAllow(): no match, setting retval=true");
         retval = true;
     } else {
@@ -561,10 +574,10 @@ typedef unsigned int        u4;
     }
 
 finalize_and_out:
-    LOGW("phornyac: doesPolicyAllow(): finalizing queryStmt and returning");
-    sqlite3_finalize(queryStmt);
-    queryStmt = NULL;
-      //XXX: optimize this function to re-use queryStmt??
+    LOGW("phornyac: doesPolicyAllow(): finalizing db_query_stmt and returning");
+    sqlite3_finalize(db_query_stmt);
+    db_query_stmt = NULL;
+      //XXX: optimize this function to re-use db_query_stmt??
 out:
     return retval;
 }
@@ -581,9 +594,45 @@ int remove_policydb_entries(policy_entry *entry) {
     return -1;
 }
 
+#define SIIIZE 5
+const char *testfile = "/data/data/com.android.settings/files/woohoo.txt";
+
 int query_policydb(policy_entry *entry) {
     LOGW("phornyac: query_policydb(): not implemented yet!");
     int taint = entry->taint_tag;
+    int ret;
+
+//XXX: debug code, remove this!!!!
+#ifdef TESTCODE
+    LOGW("phornyac: query_policydb(): checking if we can read file from RAM");
+    int fd;
+    int flags = O_RDONLY;
+    char buf[SIIIZE];
+    ret = open(testfile, flags);
+    if (ret < 0) {
+        LOGW("phornyac: query_policydb(): error opening file %s, errno=%d",
+                testfile, errno);
+    } else {
+        fd = ret;
+        ret = 1;
+        while (ret > 0) {
+            ret = read(fd, (void *)buf, SIIIZE-1);
+            if (ret < 0) {
+                LOGW("phornyac: query_policydb(): error reading file, errno=%d",
+                        errno);
+            }
+            LOGW("phornyac: query_policydb(): read %d bytes from file",
+                    ret);
+            buf[ret] = '\0';
+            LOGW("phornyac: query_policydb(): buf=\"%s\"", buf);
+        }
+        ret = close(fd);
+        if (ret < 0) {
+            LOGW("phornyac: query_policydb(): error closing file, errno=%d",
+                    errno);
+        }
+    }
+#endif
 
     if (taint) {
         LOGW("phornyac: query_policydb(): taint is nonzero, so "
@@ -595,3 +644,249 @@ int query_policydb(policy_entry *entry) {
     return 0;
 }
 
+int refresh_policydb() {
+    LOGW("phornyac: refresh_db(): entered");
+
+    LOGW("phornyac: refresh_db(): not implemented yet! Returning 0");
+    return 0;
+
+#if 0
+    /* Add some simple rows to database / table for now: */
+//XXX: can't do this!
+//Copied from dalvik/vm/Common.h:
+#ifdef HAVE_STDINT_H
+# include <stdint.h>    /* C99 */
+typedef uint32_t            u4;
+#else
+typedef unsigned int        u4;
+#endif
+//Copied from dalvik/vm/interp/Taint.h:
+#define TAINT_LOCATION_GPS  ((u4)0x00000010) /* GPS Location */
+    err = insert_row(db_ptr, db_tablename, "*", "*", TAINT_LOCATION_GPS);
+    err |= insert_row(db_ptr, db_tablename, "com.android.browser",
+            "*", 255);
+    err |= insert_row(db_ptr, db_tablename, "com.android.browser",
+            "72.14.*", 255);  //255 = 0xff
+    //(DEBUG: Get all rows in a table: SELECT * FROM Persons)
+    if (err) {
+        LOGW("phornyac: doesPolicyAllow(): insert_row() returned error, "
+                "so returning false");
+        db_ptr = NULL;  /* set back to NULL so we'll retry after error */
+        retval = false;
+        goto out;
+    }
+#endif
+}
+
+/**
+ * Creates a database table in the given database.
+ * I have no idea how to do this extensibly...
+ * 
+ * Returns: 0 on success, negative on error.
+ */
+int create_db_table(sqlite3 *db) {
+    LOGW("phornyac: create_db_table(): entered");
+    int ret;
+    char *errmsg = NULL;
+#if 0
+    int cmd_len, cmd_len_inner;
+    char *cmd;
+    char *cmd_inner;
+#endif
+
+    if (db == NULL) {
+        LOGW("phornyac: create_db_table(): error, db is NULL, "
+                "returning -1");
+        return -1;
+    }
+    //TODO: more precondition checking here??
+
+    /**
+     * Create the table:
+     * See http://sqlite.org/lang_createtable.html
+     * See http://sqlite.org/c3ref/exec.html
+     */
+#if 0
+    queryLen = strlen(select) + strlen(" ") + strlen(columns) + 
+        strlen(" ") + strlen(from) +
+        strlen(" ") + strlen(db_tablename) + strlen(" ") + strlen(where) +
+        strlen(" src=\'") + strlen(source) + strlen("\' OR src=\'*\'") + 1;
+    queryString = (char *)malloc(queryLen * sizeof(char));
+    snprintf(queryString, queryLen, "%s %s %s %s %s src=\'%s\' OR src=\'*\'",
+            select, columns, from, db_tablename, where, source);
+    LOGW("phornyac: construct_querystring(): queryLen=%d, queryString=%s",
+            queryLen, queryString);
+#endif
+#if 0
+    const char *create = "CREATE TABLE";
+    cmd_len = 0;
+    cmd_len_inner = 0;
+    /* Add lengths for col names, types, spaces and commas; may be a bit extra */
+    for (i = 0; i < COLUMNS; i++) {
+        cmd_len_inner += strlen(db_col_names[i]);
+        cmd_len_inner += strlen(db_col_types[i]);
+        cmd_len_inner += 3;
+    }
+    cmd_len = strlen(create) + strlen(" ") + strlen(db_tablename) +
+            strlen(" (") + cmd_len_inner + strlen(")");
+    cmd_inner = (char *)malloc(cmd_len_inner * sizeof(char));
+    if (!cmd_inner) {
+        LOGW("phornyac: create_db_table(): failed to allocate cmd_inner, "
+                "returning -1");
+        return -1;
+    }
+#endif
+    LOGW("phornyac: create_db_table(): calling sqlite3_exec to create "
+            "table \"%s\"", db_tablename);
+    ret = sqlite3_exec(db, db_createstring, NULL, NULL, &errmsg);
+    //LOGW("phornyac: initialize_policydb(): sqlite3_exec() returned");
+    if (ret) {
+        if (errmsg) {
+            LOGW("phornyac: create_db_table(): sqlite3_exec(CREATE TABLE) "
+                    "returned error \"%s\", so returning false", errmsg);
+            sqlite3_free(errmsg);
+        } else {
+            LOGW("phornyac: create_db_table(): sqlite3_exec(CREATE TABLE) "
+                    "returned error, errmsg=NULL");
+        }
+        LOGW("phornyac: create_db_table(): returning -1 due to errors");
+        db_ptr = NULL;  /* Good idea? */
+        return -1;
+    }
+    LOGW("phornyac: create_db_table(): successfully created table, returning");
+    return 0;
+}
+
+int initialize_policydb() {
+    LOGW("phornyac: initialize_policydb(): entered");
+    int ret;
+    //char *errmsg = NULL;
+
+    if (db_ptr != NULL) {
+        LOGW("phornyac: initialize_policydb(): error, db_ptr pointer is "
+                "not NULL! Returning -1");
+        return -1;
+    }
+    
+    /**
+     * Initialize the database connection if not already done:
+     * http://sqlite.org/c3ref/open.html
+     */
+#ifdef TESTCODE
+    //DEBUG (XXX: remove this):
+    struct stat db_stat;
+    LOGW("phornyac: initialize_policydb(): calling stat for db_filename=%s",
+            db_filename);
+    ret = stat(db_filename, &db_stat);
+    if (ret) {
+        if (errno == ENOENT) {
+            LOGW("phornyac: initialize_policydb(): stat returned errno=ENOENT, "
+                    "db file does not exist yet");
+        } else {
+            LOGW("phornyac: initialize_policydb(): stat returned other errno=%d",
+                    errno);
+        }
+    } else {
+            LOGW("phornyac: initialize_policydb(): stat succeeded, db file exists");
+    }
+#endif
+
+    /**
+     * The "standard" version of sqlite3_open() opens a database for reading
+     * and writing, and creates it if it does not exist.
+     * http://sqlite.org/c3ref/open.html
+     */
+    LOGW("phornyac: initialize_policydb(): calling sqlite3_open(%s)",
+            db_filename);
+    ret = sqlite3_open(db_filename, &db_ptr);
+    if ((ret != SQLITE_OK) || (db_ptr == NULL)) {
+        if (db_ptr == NULL) {
+            LOGW("phornyac: initialize_policydb(): sqlite3_open() returned "
+                    "NULL db_ptr!");
+        }
+        LOGW("phornyac: initialize_policydb(): sqlite3_open() error message: "
+                "%s", sqlite3_errmsg(db_ptr));
+        db_ptr = NULL;  /* Good idea? */
+        LOGW("phornyac: initialize_policydb(): returning -1 due to errors");
+        return -1;
+    }
+    LOGW("phornyac: initialize_policydb(): sqlite3_open() succeeded, "
+            "db_ptr=%p", db_ptr);
+    /* XXX: We never close the database connection: is this ok? */
+
+    /**
+     * Create the table:
+     * See http://sqlite.org/lang_createtable.html
+     * See http://sqlite.org/c3ref/exec.html
+     */
+    LOGW("phornyac: initialize_policydb(): calling create_db_table()");
+    ret = create_db_table(db_ptr);
+    if (ret < 0) {
+        LOGW("phornyac: initialize_policydb(): create_db_table() returned "
+                "error=%d, goto close_err_exit", ret);
+        goto close_err_exit;
+   }
+
+    /* Fill in the database table from a file: */
+    LOGW("phornyac: initialize_policydb(): calling refresh_policydb() "
+            "to init table");
+    ret = refresh_policydb();
+    if (ret < 0) {
+        LOGW("phornyac: initialize_policydb(): refresh_policydb() returned "
+                "error %d, goto close_err_exit", ret);
+        goto close_err_exit;
+    }
+
+
+    return 0;
+
+close_err_exit:
+    ret = sqlite3_close(db_ptr);
+    if (ret != SQLITE_OK) {
+        LOGW("phornyac: initialize_policydb(): sqlite3_close() returned "
+                "error=%d, whatever", ret);
+    }
+    LOGW("phornyac: initialize_policydb(): returning -1");
+    return -1;
+}
+
+
+//SCRATCH:
+#if 0
+    //XXX: un-hard-code this!
+    //XXX: put this in a separate function!
+    ret = sqlite3_exec(db_ptr, "CREATE TABLE policy (src TEXT, dest TEXT, taint INTEGER)",
+            NULL, NULL, &errmsg);
+    LOGW("phornyac: initialize_policydb(): sqlite3_exec() returned");
+    if (ret) {
+        if (errmsg) {
+            /**
+             * "To avoid memory leaks, the application should invoke
+             *  sqlite3_free() on error message strings returned through the
+             *  5th parameter of of sqlite3_exec() after the error message
+             *  string is no longer needed. If the 5th parameter to
+             *  sqlite3_exec() is not NULL and no errors occur, then
+             *  sqlite3_exec() sets the pointer in its 5th parameter to NULL
+             *  before returning."
+             */
+            LOGW("phornyac: doesPolicyAllow(): sqlite3_exec(CREATE TABLE) "
+                    "returned error \"%s\", so returning false", errmsg);
+            /**
+             * For some reason, when I open browser, then open maps app, I get this
+             * error from maps:
+             *   "W/dalvikvm(  475): phornyac: doesPolicyAllow(): sqlite3_exec(CREATE
+             *    TABLE) returned error "table policy already exists", so returning
+             *    false
+             * Don't get the error when using in-memory database though
+             *   (db_filename=":memory:")
+             */
+            sqlite3_free(errmsg);
+        } else {
+            LOGW("phornyac: doesPolicyAllow(): sqlite3_exec(CREATE TABLE) "
+                    "returned error, errmsg=NULL");
+        }
+        db_ptr = NULL;  /* set back to NULL so we'll retry after error */
+        retval = false;
+        goto out;
+    }
+ #endif

@@ -45,8 +45,10 @@ int query_policydb(policy_entry *entry);
 int refresh_policydb();
 
 /**
- *
- * Returns: 
+ * Initialize the policy db for the first time. Should only be called once,
+ * when policyd is started...
+ * Returns: 0 on success, negative on error.
  */
+int initialize_policydb();
 
 #endif
