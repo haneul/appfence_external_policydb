@@ -23,6 +23,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sqlite3.h>
+#include <libxml/xmlreader.h>
 #include <cutils/log.h>
 #include <policy_global.h>
 
@@ -51,37 +52,33 @@
 /**
  * Persistent variables for storing SQLite database connection, etc.
  */
-const char *db_filename = "/data/data/com.android.settings/policy.db";
-//const char *db_filename = ":memory:";
-//const char *db_filename = "/data/data/com.android.browser/policy.db";
-//const char *db_filename = "/data/data/com.android.browser/databases/policy.db";
-  //"Once created, the SQLite database is stored in the
-  // /data/data/<package_name>/databases folder of an Android device"
-  //"/data/policyDb" doesn't work, just creates an empty file
-  //  neither does "/data/data/com.android.settings/shared_prefs/policy.db"
-  //Any "scratch" locations where all apps have write access? Not really...
-  //  /sqlite_stmt_journals
+const char *db_rows = "/data/data/com.android.settings/policydb.txt";
+  /* Contains tuples matching the db_Xyz enums below; when refresh_db()
+   * is called, this file gets read in to initialize the database. */
+const char *db_xml = "/data/data/com.android.settings/policydb.xml";
+const char *db_file = "/data/data/com.android.settings/policydb.db";
+  /* Looks like this after sqlite3_open():
+   * -rw-r--r-- root     root         3072 2010-11-14 23:07 policy.db */
 sqlite3 *db_ptr = NULL;
-static bool db_default_allow = true;  //XXX: set this from global prefs!
+static bool db_default_allow = true;  //XXX: remove this!
 sqlite3_stmt *db_query_stmt = NULL;
-  //Ok to not be static: holds the current/previous query statement for
-  //  each app?
 
 /**
  * These constants define table structure/columns; all of the dbXyzs
  * should match each other!! (It's too damn hard to dynamically
- * construct the create table string, etc. in C)
+ * construct the create table string, etc. in C). ALSO, these should
+ * match what's used in the XML file!!!
  * Used by create_db_table() to create the database table.
  */
 const char *db_tablename = "policy";
 enum dbCols {    //must start at 0 for indexing into database!
-    SRC = 0,        //SQLITE_TEXT
-    DEST,           //SQLITE_TEXT
-    TAINT,          //SQLITE_INTEGER
+    SOURCE = 0,     //SQLITE_TEXT
+    DEST,       //SQLITE_TEXT
+    TAINT,      //SQLITE_INTEGER
     COLUMNS         //must always be last!!!
 };
 const char *db_col_names[] = {
-    "src",
+    "source",
     "dest",
     "taint",
 };
@@ -93,6 +90,12 @@ const char *db_col_types[] = {
 const char *db_createstring =
     "CREATE TABLE policy (src TEXT, dest TEXT, taint INTEGER)";
       //make sure string after TABLE is db_tablename
+const char *db_dropstring =
+    "DROP TABLE policy";
+      //make sure string after TABLE is db_tablename
+/* For now, we expect our depth 0 "root" XML nodes to always be named this: */
+const char *root_name = "rule";
+
 
 /**
  * Constructs a query string that gets the records/rows of the database matching
@@ -161,7 +164,7 @@ void print_row(sqlite3_stmt *stmt){
      * Get the values from the destination and taint tag columns:
      * http://sqlite.org/c3ref/column_blob.html
      */
-    dbSrc = sqlite3_column_text(stmt, SRC);
+    dbSrc = sqlite3_column_text(stmt, SOURCE);
     dbDest = sqlite3_column_text(stmt, DEST);
     dbTaint = sqlite3_column_int(stmt, TAINT);
  
@@ -236,18 +239,24 @@ bool check_row_for_match(sqlite3_stmt *db_query_stmt, const char *dest, int tain
 
 /**
  * Adds the given (source, dest, taint) triple to the database table.
+ * None of the inputs should be NULL!
  * Returns 0 on success, negative on error.
  */
 int insert_row(sqlite3 *db, const char *tableName, const char *source,
-        const char *dest, int taint) {
+        const char *dest, const char *taint) {
     sqlite3_stmt *insertStmt;
     int len;
     int err;
     char *insertString;
-    char taintString[32];
-      //2^64 = 18446744073709551616, which is 20 digits
 
     LOGW("phornyac: insert_row(): entered");
+    //(DEBUG: Get all rows in a table: SELECT * FROM Persons)
+
+    if (!source || !dest || !taint) {
+        LOGW("phornyac: insert_row(): one of source||dest||taint is NULL, "
+                "returning -1");
+        return -1;
+    }
 
     /**
      * Construct the INSERT string:
@@ -257,19 +266,14 @@ int insert_row(sqlite3 *db, const char *tableName, const char *source,
      */
     const char *insertInto = "INSERT INTO";
     const char *values = "VALUES";
-    /* Convert taint int to string: */
-    snprintf(taintString, 32, "%d", taint);
-      //Should be a decimal integer going into database, not hex!
-    LOGW("phornyac: insert_row(): calculated taintString=%s, len=%d",
-            taintString, strlen(taintString));
     len = strlen(insertInto) + strlen(" ") + strlen(tableName) + 
         strlen(" ") + strlen(values) + strlen(" (\'") + strlen(source) +
-        strlen("\', \'") + strlen(dest) + strlen("\', \'") + strlen(taintString) +
+        strlen("\', \'") + strlen(dest) + strlen("\', \'") + strlen(taint) +
         strlen("\')") + 1;
     insertString = malloc(len * sizeof(char));
     /* Must use quotes around column values inside () ! */
     snprintf(insertString, len, "%s %s %s (\'%s\', \'%s\', \'%s\')",
-            insertInto, tableName, values, source, dest, taintString);
+            insertInto, tableName, values, source, dest, taint);
     LOGW("phornyac: insert_row(): constructed insertString=%s", insertString);
 
     /**
@@ -312,6 +316,7 @@ int insert_row(sqlite3 *db, const char *tableName, const char *source,
     return 0;
 }
 
+#if 0
 /**
  * Checks the (source, dest, taint) triple against the currently selected
  * policy.
@@ -333,6 +338,9 @@ bool doesPolicyAllow(const char *processName, const char *destName, int tag) {
     LOGW("phornyac: doesPolicyAllow(): processName=%s, destName=%s, tag=0x%X",
             processName, destName, tag);
 
+    LOGW("phornyac: doesPolicyAllow(): OBSOLETE, returning false!!");
+    return false;
+
     /* Use snprintf() to generate db filename? */
     //...
 
@@ -344,9 +352,9 @@ bool doesPolicyAllow(const char *processName, const char *destName, int tag) {
         LOGW("phornyac: doesPolicyAllow(): db_ptr is NULL, initializing");
 
         //DEBUG (XXX: remove this):
-        LOGW("phornyac: doesPolicyAllow(): calling stat for db_filename=%s",
-                db_filename);
-        err = stat(db_filename, &dbStat);
+        LOGW("phornyac: doesPolicyAllow(): calling stat for db_file=%s",
+                db_file);
+        err = stat(db_file, &dbStat);
         if (err) {
             if (errno == ENOENT) {
                 LOGW("phornyac: doesPolicyAllow(): stat returned errno=ENOENT, "
@@ -364,13 +372,13 @@ bool doesPolicyAllow(const char *processName, const char *destName, int tag) {
         //Right now, it's instantiated once per application!
         //  Figure out a more central place to put it...
         LOGW("phornyac: doesPolicyAllow(): calling sqlite3_open(%s)",
-                db_filename);
+                db_file);
         /**
          * The "standard" version of sqlite3_open() opens a database for reading
          * and writing, and creates it if it does not exist.
          * http://sqlite.org/c3ref/open.html
          */
-        err = sqlite3_open(db_filename, &db_ptr);
+        err = sqlite3_open(db_file, &db_ptr);
         if ((err != SQLITE_OK) || (db_ptr == NULL)) {
             if (db_ptr == NULL) {
                 LOGW("phornyac: doesPolicyAllow(): sqlite3_open() returned "
@@ -418,7 +426,7 @@ bool doesPolicyAllow(const char *processName, const char *destName, int tag) {
                  *    TABLE) returned error "table policy already exists", so returning
                  *    false
                  * Don't get the error when using in-memory database though
-                 *   (db_filename=":memory:")
+                 *   (db_file=":memory:")
                  */
                 sqlite3_free(errmsg);
             } else {
@@ -581,6 +589,7 @@ finalize_and_out:
 out:
     return retval;
 }
+#endif
 
 int add_policydb_entry(policy_entry *entry) {
     LOGW("phornyac: add_policydb_entry(): not implemented yet! "
@@ -594,15 +603,16 @@ int remove_policydb_entries(policy_entry *entry) {
     return -1;
 }
 
+#ifdef TESTCODE
 #define SIIIZE 5
 const char *testfile = "/data/data/com.android.settings/files/woohoo.txt";
+#endif
 
 int query_policydb(policy_entry *entry) {
     LOGW("phornyac: query_policydb(): not implemented yet!");
     int taint = entry->taint_tag;
     int ret;
 
-//XXX: debug code, remove this!!!!
 #ifdef TESTCODE
     LOGW("phornyac: query_policydb(): checking if we can read file from RAM");
     int fd;
@@ -644,38 +654,311 @@ int query_policydb(policy_entry *entry) {
     return 0;
 }
 
-int refresh_policydb() {
-    LOGW("phornyac: refresh_db(): entered");
+void print_xml_node(xmlTextReaderPtr reader) {
+    xmlChar *name = NULL;
+    xmlChar *value = NULL;
+    int depth, type, is_empty;
 
-    LOGW("phornyac: refresh_db(): not implemented yet! Returning 0");
+    name = xmlTextReaderName(reader);
+    if (name == NULL)
+        name = xmlStrdup(BAD_CAST "--");  //what does this mean???
+    value = xmlTextReaderValue(reader);
+    depth = xmlTextReaderDepth(reader);
+    type = xmlTextReaderNodeType(reader);
+    is_empty = xmlTextReaderIsEmptyElement(reader);
+
+    LOGW("phornyac: print_xml_node: depth=%d, type=%d, name=%s, value=%s, "
+            "is_empty=%d", depth, type, (name!=NULL) ? (char *)name : "NULL",
+            (value!=NULL) ? (char *)value : "NULL", is_empty);
+    if (name)
+        xmlFree(name);
+    if (value)
+        xmlFree(value);
+}
+
+#define RULEDEPTH 1
+
+/* Entirely process a depth-0 XML node, which should correspond to one
+ * "rule" that we want to add to the database. The reader should point
+ * at the "start element" depth-0 XML node to start, and will be advanced
+ * just past the "end element" node for this depth-0 node before returning
+ * successfully.
+ *
+ * IMPORTANT: for XML node types, see http://xmlsoft.org/xmlreader.html
+ * 
+ * Returns the value of xmlTextReaderRead() on success, or negative on error.
+ */
+int process_xmlnode_depth_zero(xmlTextReaderPtr reader) {
+    LOGW("phornyac: process_xmlnode_depth_zero(): entered");
+    xmlChar *name = NULL;
+    xmlChar *value = NULL;
+    int type;
+    int cur_element = -1;
+    int ret;
+    /* The following items actually go in the db row: */
+    xmlChar *source = NULL;  //type should be "typedef unsigned char xmlChar"
+    xmlChar *dest = NULL;
+    xmlChar *taint = NULL;
+
+    /* Sample file:
+     *   <?xml version="1.0"?>
+     *   <rule prop1="test property 1" prop2="&amp; test prop 2">
+     *     <source>com.android.browser</source>
+     *     <dest>72.14.*</dest>
+     *     <taint>255</taint>
+     *   </rule>
+     */
+    
+    LOGW("phornyac: process_xmlnode_depth_zero: printing start xml node");
+    print_xml_node(reader);
+
+    /* We expect the current node to have depth 0 and to be the start of
+     * an element. For now, we only expect depth-0 nodes to have the
+     * name "rule". */
+    name = xmlTextReaderName(reader);
+    if ((xmlTextReaderDepth(reader) != RULEDEPTH) ||
+        (xmlTextReaderNodeType(reader) != 1) ||
+        (strncmp((char *)name, root_name, strlen(root_name)) != 0)) {
+        LOGW("phornyac: process_xmlnode_depth_zero: invalid node, "
+                "advancing and returning");
+        xmlFree(name);
+        ret = xmlTextReaderRead(reader);
+        return ret;
+    }
+    xmlFree(name);
+
+    /* Loop until we reach another node of depth RULEDEPTH... */
+    ret = xmlTextReaderRead(reader);
+    while ((ret == 1) && (xmlTextReaderDepth(reader) > RULEDEPTH)) {
+        LOGW("phornyac: process_xmlnode_depth_zero: start of while loop, "
+                "printing xml node");
+        print_xml_node(reader);
+
+        type = xmlTextReaderNodeType(reader);
+        switch(type) {
+        case 1:
+            /* Remember the type of element we're starting with cur_element: */
+            name = xmlTextReaderName(reader);
+            LOGW("phornyac: process_xmlnode_depth_zero: start element, name=%s", name);
+            if (cur_element != -1) {
+                //XXX: if this happens, means we have deeper nesting...
+                //  which we don't handle yet.
+                LOGW("phornyac: process_xmlnode_depth_zero: warning, "
+                        "cur_element is %d, not -1 as expected!", cur_element);
+            }
+//            LOGW("phornyac: process_xmlnode_depth_zero: name=%s, "
+//                    "db_col_names[SOURCE]=%s, strlen(db_col_names[SOURCE])=%d",
+//                    (char *)name, db_col_names[SOURCE],
+//                    strlen(db_col_names[SOURCE]));
+//            LOGW("phornyac: process_xmlnode_depth_zero: name=%s, "
+//                    "db_col_names[DEST]=%s, strlen(db_col_names[DEST])=%d",
+//                    (char *)name, db_col_names[DEST],
+//                    strlen(db_col_names[DEST]));
+//            LOGW("phornyac: process_xmlnode_depth_zero: name=%s, "
+//                    "db_col_names[TAINT]=%s, strlen(db_col_names[TAINT])=%d",
+//                    (char *)name, db_col_names[TAINT],
+//                    strlen(db_col_names[TAINT]));
+            if (strncmp((char *)name, db_col_names[SOURCE],
+                        strlen(db_col_names[SOURCE])) == 0) {
+                LOGW("phornyac: process_xmlnode_depth_zero: setting "
+                        "cur_element to SOURCE");
+                cur_element = SOURCE;
+            } else if (strncmp((char *)name, db_col_names[DEST],
+                               strlen(db_col_names[DEST])) == 0) {
+                LOGW("phornyac: process_xmlnode_depth_zero: setting "
+                        "cur_element to DEST");
+                cur_element = DEST;
+            } else if (strncmp((char *)name, db_col_names[TAINT],
+                               strlen(db_col_names[TAINT])) == 0) {
+                LOGW("phornyac: process_xmlnode_depth_zero: setting "
+                        "cur_element to TAINT");
+                cur_element = TAINT;
+            } else {
+                LOGW("phornyac: process_xmlnode_depth_zero: unknown element "
+                        "name, setting cur_element to -1");
+                cur_element = -1;
+            }
+            xmlFree(name);
+            break;
+        case 3:
+            /* Grab the value and store it in preparation for using it in
+             * a database row: */
+            value = xmlTextReaderValue(reader);
+            LOGW("phornyac: process_xmlnode_depth_zero: text node, value=%s",
+                    value);
+            switch(cur_element) {
+            case SOURCE:
+                if (source) {
+                    LOGW("phornyac: process_xmlnode_depth_zero: source is "
+                            "not NULL; this is unexpected, freeing it "
+                            "before overwriting");
+                    xmlFree(source);
+                }
+                source = xmlStrdup(value);
+                LOGW("phornyac: process_xmlnode_depth_zero: saved source=%s",
+                        source);
+                break;
+            case DEST:
+                if (dest) {
+                    LOGW("phornyac: process_xmlnode_depth_zero: dest is "
+                            "not NULL; this is unexpected, freeing it "
+                            "before overwriting");
+                    xmlFree(dest);
+                }
+                dest = xmlStrdup(value);
+                LOGW("phornyac: process_xmlnode_depth_zero: saved dest=%s",
+                        dest);
+                break;
+            case TAINT:
+                if (taint) {
+                    LOGW("phornyac: process_xmlnode_depth_zero: taint is "
+                            "not NULL; this is unexpected, freeing it "
+                            "before overwriting");
+                    xmlFree(taint);
+                }
+                taint = xmlStrdup(value);
+                LOGW("phornyac: process_xmlnode_depth_zero: saved taint=%s",
+                        taint);
+                break;
+            default:
+                LOGW("phornyac: process_xmlnode_depth_zero: unexpected value "
+                        "for cur_element, doing nothing");
+                break;
+            }
+            xmlFree(value);
+            break;
+        case 15:
+            /* Reset the cur_element that we're keeping track of and insert
+             * a new database row:*/
+            name = xmlTextReaderName(reader);
+            LOGW("phornyac: process_xmlnode_depth_zero: end element, name=%s",
+                    (char *)name);
+            xmlFree(name);
+            if (cur_element == -1) {
+                LOGW("phornyac: process_xmlnode_depth_zero: cur_element is -1, "
+                        "so we lost the start element; doing nothing here");
+                break;
+            }
+            cur_element = -1;
+            break;
+        default:
+            LOGW("phornyac: process_xmlnode_depth_zero: ignoring node "
+                    "with type=%d", type);
+            break;
+        }
+
+        /* Advance to the next node: */
+        ret = xmlTextReaderRead(reader);
+    }
+
+    /* We expect to break out of the loop when we've reached the "end element"
+     * node of depth 0. */
+    if (xmlTextReaderDepth(reader) != RULEDEPTH) {
+        LOGW("phornyac: process_xmlnode_depth_zero: ended up in an "
+                "unexpected place, ret=%d, depth=%d; returning -1",
+                ret, xmlTextReaderDepth(reader));
+        return -1;
+    }
+    if (xmlTextReaderNodeType(reader) != 15) {
+        LOGW("phornyac: process_xmlnode_depth_zero: ended up in an "
+                "unexpected place, ret=%d, type=%d; returning -1",
+                ret, xmlTextReaderNodeType(reader));
+        return -1;
+    }
+
+    /* If we've reached here, then we finally want to insert the values
+     * we've saved as a new db row: */
+    //TODO: if source or dest or taint wasn't specified, make it a
+    //  wildcard?? Right now, insert_row() just returns an error.
+    ret = insert_row(db_ptr, db_tablename,
+            (char *)source, (char *)dest, (char *)taint);
+    if (source)
+        xmlFree(source);
+    if (dest)
+        xmlFree(dest);
+    if (taint)
+        xmlFree(taint);
+    ///* I hope that xmlFree sets the pointers to NULL, but I'm not sure. */
+    //if (source || dest || taint) {
+    //    LOGW("phornyac: process_xmlnode_depth_zero: WARNING, "
+    //            "xmlFree() does not reset pointers to NULL, "
+    //            "need to go back and account for this!");
+    //}
+    if (ret) {
+        LOGW("phornyac: process_xmlnode_depth_zero: insert_row() "
+                "returned error=%d, so returning -1", ret);
+        /* Everything should be cleaned up by now */
+        return -1;
+    }
+
+    /* Finally, advance just past the "end element" node for the
+     * depth-zero node we just processed, and return. */
+    ret = xmlTextReaderRead(reader);
+    if (ret < 0) {
+        LOGW("phornyac: process_xmlnode_depth_zero: final "
+                "xmlTextReaderRead() returned error=%d, returning -1",
+                ret);
+        return -1;
+    }
+    LOGW("phornyac: process_xmlnode_depth_zero: success, returning ret=%d "
+            "from last xmlTextReaderRead()", ret);
+    return ret;
+}
+
+int refresh_policydb() {
+    LOGW("phornyac: refresh_policydb(): entered");
+    int ret;
+    xmlTextReaderPtr reader;
+
+    if (!db_ptr) {
+        LOGW("phornyac: refresh_policydb(): db_ptr is NULL, goto return_err");
+        goto return_err;
+    }
+
+    LOGW("phornyac: refresh_policydb(): clearing out existing db (TODO!!!)");
+    //TODO!!!!!!!!!!!!!!!!!!!!
+
+    /* Parse the XML input file: */
+    reader = xmlNewTextReaderFilename(db_xml);
+    if (reader == NULL) {
+        LOGW("phornyac: refresh_policydb(): xmlNewTextReaderFilename(%s) "
+                "failed, goto return_err", db_xml);
+        goto return_err;
+    }
+    ret = xmlTextReaderRead(reader);
+    while (ret == 1) {
+        LOGW("phornyac: refresh_policydb(): start of while loop, "
+                "printing node");
+        print_xml_node(reader);
+        /* We process the XML file by calling a particular function to handle
+         * each type of node at depth 0 of the XML tree. We expect that the
+         * handling function will advance the reader just past the "end
+         * element" node for the zero-depth node it just processed, which
+         * will presumably leave the reader pointing at a "start element"
+         * node for the next zero-depth node (or the end of the file), and
+         * we'll never hit the else case here. */
+        if (xmlTextReaderDepth(reader) == RULEDEPTH) {
+            LOGW("phornyac: refresh_policydb(): depth is 1, processing node");
+            ret = process_xmlnode_depth_zero(reader);
+        } else {
+            LOGW("phornyac: refresh_policydb(): xmlTextReaderDepth() "
+                    "is not 1, ignoring this node");
+            ret = xmlTextReaderRead(reader);  /* next node */
+        }
+    }
+    /* Free reader resources; 0 return value means EOF, otherwise error */
+    xmlFreeTextReader(reader);
+    if (ret != 0) {
+        LOGW("phornyac: refresh_policydb(): parse error, ret=%d; "
+                "goto return_err", ret);
+        goto return_err;
+    }
+
     return 0;
 
-#if 0
-    /* Add some simple rows to database / table for now: */
-//XXX: can't do this!
-//Copied from dalvik/vm/Common.h:
-#ifdef HAVE_STDINT_H
-# include <stdint.h>    /* C99 */
-typedef uint32_t            u4;
-#else
-typedef unsigned int        u4;
-#endif
-//Copied from dalvik/vm/interp/Taint.h:
-#define TAINT_LOCATION_GPS  ((u4)0x00000010) /* GPS Location */
-    err = insert_row(db_ptr, db_tablename, "*", "*", TAINT_LOCATION_GPS);
-    err |= insert_row(db_ptr, db_tablename, "com.android.browser",
-            "*", 255);
-    err |= insert_row(db_ptr, db_tablename, "com.android.browser",
-            "72.14.*", 255);  //255 = 0xff
-    //(DEBUG: Get all rows in a table: SELECT * FROM Persons)
-    if (err) {
-        LOGW("phornyac: doesPolicyAllow(): insert_row() returned error, "
-                "so returning false");
-        db_ptr = NULL;  /* set back to NULL so we'll retry after error */
-        retval = false;
-        goto out;
-    }
-#endif
+return_err:
+    LOGW("phornyac: refresh_policydb(): returning -1");
+    return -1;
 }
 
 /**
@@ -688,11 +971,6 @@ int create_db_table(sqlite3 *db) {
     LOGW("phornyac: create_db_table(): entered");
     int ret;
     char *errmsg = NULL;
-#if 0
-    int cmd_len, cmd_len_inner;
-    char *cmd;
-    char *cmd_inner;
-#endif
 
     if (db == NULL) {
         LOGW("phornyac: create_db_table(): error, db is NULL, "
@@ -702,48 +980,38 @@ int create_db_table(sqlite3 *db) {
     //TODO: more precondition checking here??
 
     /**
+     * Delete the table if it already exists. It's probably a better idea
+     * to actually check if the table exists or not before attempting to
+     * delete it (which will presumably cause an error if the table isn't
+     * actually there), but oh well.
+     * See: http://www.1keydata.com/sql/sqldrop.html
+     */
+    LOGW("phornyac: create_db_table(): calling sqlite3_exec to clear out "
+            "table \"%s\"", db_tablename);
+    ret = sqlite3_exec(db, db_dropstring, NULL, NULL, &errmsg);
+    if (ret) {
+        if (errmsg) {
+            LOGW("phornyac: create_db_table(): sqlite3_exec(DROP TABLE) "
+                    "returned error \"%s\", ignoring", errmsg);
+            sqlite3_free(errmsg);
+        } else {
+            LOGW("phornyac: create_db_table(): sqlite3_exec(DROP TABLE) "
+                    "returned error NULL, ignoring");
+        }
+    }
+
+    /**
      * Create the table:
      * See http://sqlite.org/lang_createtable.html
      * See http://sqlite.org/c3ref/exec.html
      */
-#if 0
-    queryLen = strlen(select) + strlen(" ") + strlen(columns) + 
-        strlen(" ") + strlen(from) +
-        strlen(" ") + strlen(db_tablename) + strlen(" ") + strlen(where) +
-        strlen(" src=\'") + strlen(source) + strlen("\' OR src=\'*\'") + 1;
-    queryString = (char *)malloc(queryLen * sizeof(char));
-    snprintf(queryString, queryLen, "%s %s %s %s %s src=\'%s\' OR src=\'*\'",
-            select, columns, from, db_tablename, where, source);
-    LOGW("phornyac: construct_querystring(): queryLen=%d, queryString=%s",
-            queryLen, queryString);
-#endif
-#if 0
-    const char *create = "CREATE TABLE";
-    cmd_len = 0;
-    cmd_len_inner = 0;
-    /* Add lengths for col names, types, spaces and commas; may be a bit extra */
-    for (i = 0; i < COLUMNS; i++) {
-        cmd_len_inner += strlen(db_col_names[i]);
-        cmd_len_inner += strlen(db_col_types[i]);
-        cmd_len_inner += 3;
-    }
-    cmd_len = strlen(create) + strlen(" ") + strlen(db_tablename) +
-            strlen(" (") + cmd_len_inner + strlen(")");
-    cmd_inner = (char *)malloc(cmd_len_inner * sizeof(char));
-    if (!cmd_inner) {
-        LOGW("phornyac: create_db_table(): failed to allocate cmd_inner, "
-                "returning -1");
-        return -1;
-    }
-#endif
     LOGW("phornyac: create_db_table(): calling sqlite3_exec to create "
             "table \"%s\"", db_tablename);
     ret = sqlite3_exec(db, db_createstring, NULL, NULL, &errmsg);
-    //LOGW("phornyac: initialize_policydb(): sqlite3_exec() returned");
     if (ret) {
         if (errmsg) {
             LOGW("phornyac: create_db_table(): sqlite3_exec(CREATE TABLE) "
-                    "returned error \"%s\", so returning false", errmsg);
+                    "returned error \"%s\"", errmsg);
             sqlite3_free(errmsg);
         } else {
             LOGW("phornyac: create_db_table(): sqlite3_exec(CREATE TABLE) "
@@ -762,6 +1030,34 @@ int initialize_policydb() {
     int ret;
     //char *errmsg = NULL;
 
+//#ifdef TESTCODE
+#if 0
+    enum dbCols {    //must start at 0 for indexing into database!
+    SOURCE = 0,     //SQLITE_TEXT
+    DEST,       //SQLITE_TEXT
+    TAINT,      //SQLITE_INTEGER
+    COLUMNS         //must always be last!!!
+};
+const char *db_col_names[] = {
+    "source",
+    "dest",
+    "taint",
+};
+const char *db_col_types[] = {
+    "TEXT",
+    "TEXT",
+    "INTEGER",
+};
+#endif
+//
+//    LOGW("phornyac: policydb: SOURCE=%d, DEST=%d, TAINT=%d, COLUMNS=%d",
+//            SOURCE, DEST, TAINT, COLUMNS);
+//    LOGW("phornyac: policydb: db_col_names[0]=%s, [1]=%s, [2]=%s",
+//            db_col_names[0], db_col_names[1], db_col_names[2]);
+//    LOGW("phornyac: policydb: db_col_types[0]=%s, [1]=%s, [2]=%s",
+//            db_col_types[0], db_col_types[1], db_col_types[2]);
+//#endif
+
     if (db_ptr != NULL) {
         LOGW("phornyac: initialize_policydb(): error, db_ptr pointer is "
                 "not NULL! Returning -1");
@@ -773,11 +1069,10 @@ int initialize_policydb() {
      * http://sqlite.org/c3ref/open.html
      */
 #ifdef TESTCODE
-    //DEBUG (XXX: remove this):
     struct stat db_stat;
-    LOGW("phornyac: initialize_policydb(): calling stat for db_filename=%s",
-            db_filename);
-    ret = stat(db_filename, &db_stat);
+    LOGW("phornyac: initialize_policydb(): calling stat for db_file=%s",
+            db_file);
+    ret = stat(db_file, &db_stat);
     if (ret) {
         if (errno == ENOENT) {
             LOGW("phornyac: initialize_policydb(): stat returned errno=ENOENT, "
@@ -797,8 +1092,8 @@ int initialize_policydb() {
      * http://sqlite.org/c3ref/open.html
      */
     LOGW("phornyac: initialize_policydb(): calling sqlite3_open(%s)",
-            db_filename);
-    ret = sqlite3_open(db_filename, &db_ptr);
+            db_file);
+    ret = sqlite3_open(db_file, &db_ptr);
     if ((ret != SQLITE_OK) || (db_ptr == NULL)) {
         if (db_ptr == NULL) {
             LOGW("phornyac: initialize_policydb(): sqlite3_open() returned "
@@ -812,7 +1107,6 @@ int initialize_policydb() {
     }
     LOGW("phornyac: initialize_policydb(): sqlite3_open() succeeded, "
             "db_ptr=%p", db_ptr);
-    /* XXX: We never close the database connection: is this ok? */
 
     /**
      * Create the table:
@@ -850,43 +1144,101 @@ close_err_exit:
     return -1;
 }
 
-
-//SCRATCH:
 #if 0
-    //XXX: un-hard-code this!
-    //XXX: put this in a separate function!
-    ret = sqlite3_exec(db_ptr, "CREATE TABLE policy (src TEXT, dest TEXT, taint INTEGER)",
-            NULL, NULL, &errmsg);
-    LOGW("phornyac: initialize_policydb(): sqlite3_exec() returned");
-    if (ret) {
-        if (errmsg) {
-            /**
-             * "To avoid memory leaks, the application should invoke
-             *  sqlite3_free() on error message strings returned through the
-             *  5th parameter of of sqlite3_exec() after the error message
-             *  string is no longer needed. If the 5th parameter to
-             *  sqlite3_exec() is not NULL and no errors occur, then
-             *  sqlite3_exec() sets the pointer in its 5th parameter to NULL
-             *  before returning."
-             */
-            LOGW("phornyac: doesPolicyAllow(): sqlite3_exec(CREATE TABLE) "
-                    "returned error \"%s\", so returning false", errmsg);
-            /**
-             * For some reason, when I open browser, then open maps app, I get this
-             * error from maps:
-             *   "W/dalvikvm(  475): phornyac: doesPolicyAllow(): sqlite3_exec(CREATE
-             *    TABLE) returned error "table policy already exists", so returning
-             *    false
-             * Don't get the error when using in-memory database though
-             *   (db_filename=":memory:")
-             */
-            sqlite3_free(errmsg);
-        } else {
-            LOGW("phornyac: doesPolicyAllow(): sqlite3_exec(CREATE TABLE) "
-                    "returned error, errmsg=NULL");
-        }
-        db_ptr = NULL;  /* set back to NULL so we'll retry after error */
-        retval = false;
-        goto out;
+/* Copied the original "insert_row()" here: */
+/**
+ * Adds the given (source, dest, taint) triple to the database table.
+ * Any of the inputs may be NULL, in which case they will be replaced
+ * with a wildcard that matches anything.
+ * Returns 0 on success, negative on error.
+ */
+int insert_row(sqlite3 *db, const char *tableName, const char *source,
+        const char *dest, int taint) {
+    sqlite3_stmt *insertStmt;
+    int len;
+    int err;
+    char *insertString;
+    char taintString[32];
+      //2^64 = 18446744073709551616, which is 20 digits long, so we
+      //  should easily fit in a 32-byte string
+
+    LOGW("phornyac: insert_row(): entered");
+    //(DEBUG: Get all rows in a table: SELECT * FROM Persons)
+
+    /**
+     * Construct the INSERT string:
+     *   INSERT INTO table_name VALUES (source, dest, taint)
+     * See http://www.w3schools.com/sql/sql_insert.asp
+     * XXX: not safe from injection attack???
+     */
+    const char *insertInto = "INSERT INTO";
+    const char *values = "VALUES";
+    /* Convert taint int to string: */
+    snprintf(taintString, 32, "%d", taint);
+      //Should be a decimal integer going into database, not hex!
+    LOGW("phornyac: insert_row(): calculated taintString=%s, len=%d",
+            taintString, strlen(taintString));
+    len = strlen(insertInto) + strlen(" ") + strlen(tableName) + 
+        strlen(" ") + strlen(values) + strlen(" (\'") + strlen(source) +
+        strlen("\', \'") + strlen(dest) + strlen("\', \'") + strlen(taintString) +
+        strlen("\')") + 1;
+    insertString = malloc(len * sizeof(char));
+    /* Must use quotes around column values inside () ! */
+    snprintf(insertString, len, "%s %s %s (\'%s\', \'%s\', \'%s\')",
+            insertInto, tableName, values, source, dest, taintString);
+    LOGW("phornyac: insert_row(): constructed insertString=%s", insertString);
+
+    /**
+     * Prepare an SQLite statement with the INSERT string:
+     * See http://sqlite.org/c3ref/prepare.html
+     */
+    LOGW("phornyac: insert_row(): calling sqlite3_prepare_v2()");
+    err = sqlite3_prepare_v2(db, insertString, len, &insertStmt, NULL);
+    free(insertString);
+    if (err != SQLITE_OK) {
+        LOGW("phornyac: insert_row(): sqlite3_prepare_v2() returned "
+                "error: %s", sqlite3_errmsg(db));
+        LOGW("phornyac: insert_row(): returning -1 due to errors");
+        return -1;
     }
- #endif
+
+    /**
+     * Execute the prepared statement:
+     */
+    LOGW("phornyac: insert_row(): calling sqlite3_step() to execute "
+            "INSERT statement");
+    err = sqlite3_step(insertStmt);
+    if (err != SQLITE_DONE) {
+        LOGW("phornyac: insert_row(): sqlite3_step() returned "
+                "error: %s", sqlite3_errmsg(db));
+        LOGW("phornyac: insert_row(): returning -1 due to errors");
+        sqlite3_finalize(insertStmt);  //ignore return value
+        return -1;
+    }
+ 
+    /* Finalize and return: */
+    LOGW("phornyac: insert_row(): INSERT succeeded, finalizing and returning");
+    err = sqlite3_finalize(insertStmt);
+    if (err != SQLITE_OK) {
+        LOGW("phornyac: insert_row(): sqlite3_finalize() returned "
+                "error: %s", sqlite3_errmsg(db));
+        LOGW("phornyac: insert_row(): returning -1 due to errors");
+        return -1;
+    }
+    return 0;
+}
+#endif
+
+#if 0
+    /*  //This works for text file, but want to use XML
+    LOGW("phornyac: refresh_policydb(): opening db input file %s", db_rows);
+    flags = O_RDONLY;
+    ret = open(db_rows, flags);
+    if (ret < 0) {
+        LOGW("phornyac: refresh_policydb(): error opening file %s, errno=%d",
+                db_rows, errno);
+        goto return_err;
+    }
+    fd = ret;
+    */
+#endif
