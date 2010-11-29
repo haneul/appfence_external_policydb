@@ -52,10 +52,6 @@
 /**
  * Persistent variables for storing SQLite database connection, etc.
  */
-const char *db_rows = "/data/data/com.android.settings/policydb.txt";
-  /* Contains tuples matching the db_Xyz enums below; when refresh_db()
-   * is called, this file gets read in to initialize the database. */
-const char *db_xml = "/data/data/com.android.settings/policydb.xml";
 const char *db_file = "/data/data/com.android.settings/policydb.db";
   /* Looks like this after sqlite3_open():
    * -rw-r--r-- root     root         3072 2010-11-14 23:07 policy.db */
@@ -629,64 +625,9 @@ int process_xmlnode_depth_zero(xmlTextReaderPtr reader) {
     return ret;
 }
 
-int refresh_policydb() {
-    LOGW("phornyac: refresh_policydb(): entered");
-    int ret;
-    xmlTextReaderPtr reader;
-
-    if (!db_ptr) {
-        LOGW("phornyac: refresh_policydb(): db_ptr is NULL, goto return_err");
-        goto return_err;
-    }
-
-    LOGW("phornyac: refresh_policydb(): clearing out existing db (TODO!!!)");
-    //TODO!!!!!!!!!!!!!!!!!!!!
-
-    /* Parse the XML input file: */
-    reader = xmlNewTextReaderFilename(db_xml);
-    if (reader == NULL) {
-        LOGW("phornyac: refresh_policydb(): xmlNewTextReaderFilename(%s) "
-                "failed, goto return_err", db_xml);
-        goto return_err;
-    }
-    ret = xmlTextReaderRead(reader);
-    while (ret == 1) {
-        LOGW("phornyac: refresh_policydb(): start of while loop, "
-                "printing node");
-        print_xml_node(reader);
-        /* We process the XML file by calling a particular function to handle
-         * each type of node at depth 0 of the XML tree. We expect that the
-         * handling function will advance the reader just past the "end
-         * element" node for the zero-depth node it just processed, which
-         * will presumably leave the reader pointing at a "start element"
-         * node for the next zero-depth node (or the end of the file), and
-         * we'll never hit the else case here. */
-        if (xmlTextReaderDepth(reader) == RULEDEPTH) {
-            LOGW("phornyac: refresh_policydb(): depth is 1, processing node");
-            ret = process_xmlnode_depth_zero(reader);
-        } else {
-            LOGW("phornyac: refresh_policydb(): xmlTextReaderDepth() "
-                    "is not 1, ignoring this node");
-            ret = xmlTextReaderRead(reader);  /* next node */
-        }
-    }
-    /* Free reader resources; 0 return value means EOF, otherwise error */
-    xmlFreeTextReader(reader);
-    if (ret != 0) {
-        LOGW("phornyac: refresh_policydb(): parse error, ret=%d; "
-                "goto return_err", ret);
-        goto return_err;
-    }
-
-    return 0;
-
-return_err:
-    LOGW("phornyac: refresh_policydb(): returning -1");
-    return -1;
-}
-
 /**
- * Creates a database table in the given database.
+ * Creates a database table in the given database. Uses DROP TABLE
+ * command to first clear out the existing database table.
  * I have no idea how to do this extensibly...
  * 
  * Returns: 0 on success, negative on error.
@@ -749,11 +690,127 @@ int create_db_table(sqlite3 *db) {
     return 0;
 }
 
+int refresh_policydb() {
+    int ret;
+    xmlTextReaderPtr reader;
+    LOGW("phornyac: refresh_policydb(): entered");
+
+    if (!db_ptr) {
+        LOGW("phornyac: refresh_policydb(): db_ptr is NULL, goto return_err");
+        goto return_err;
+    }
+
+    LOGW("phornyac: refresh_policydb(): calling create_db_table() to "
+            "clear out existing db and create new table");
+    ret = create_db_table(db_ptr);
+    if (ret < 0) {
+        LOGW("phornyac: refresh_policydb(): create_db_table() returned "
+                "error=%d, goto return_err", ret);
+        goto return_err;
+    }
+
+    /* Parse the XML input file: */
+    reader = xmlNewTextReaderFilename(policydb_xmlfile);
+    if (reader == NULL) {
+        LOGW("phornyac: refresh_policydb(): xmlNewTextReaderFilename(%s) "
+                "failed, goto return_err", policydb_xmlfile);
+        goto return_err;
+    }
+    ret = xmlTextReaderRead(reader);
+    while (ret == 1) {
+        LOGW("phornyac: refresh_policydb(): start of while loop, "
+                "printing node");
+        print_xml_node(reader);
+        /* We process the XML file by calling a particular function to handle
+         * each type of node at depth 0 of the XML tree. We expect that the
+         * handling function will advance the reader just past the "end
+         * element" node for the zero-depth node it just processed, which
+         * will presumably leave the reader pointing at a "start element"
+         * node for the next zero-depth node (or the end of the file), and
+         * we'll never hit the else case here. */
+        if (xmlTextReaderDepth(reader) == RULEDEPTH) {
+            LOGW("phornyac: refresh_policydb(): depth is 1, processing node");
+            ret = process_xmlnode_depth_zero(reader);
+        } else {
+            LOGW("phornyac: refresh_policydb(): xmlTextReaderDepth() "
+                    "is not 1, ignoring this node");
+            ret = xmlTextReaderRead(reader);  /* next node */
+        }
+    }
+    /* Free reader resources; 0 return value means EOF, otherwise error */
+    xmlFreeTextReader(reader);
+    if (ret != 0) {
+        LOGW("phornyac: refresh_policydb(): parse error, ret=%d; "
+                "goto return_err", ret);
+        goto return_err;
+    }
+
+    return 0;
+
+return_err:
+    LOGW("phornyac: refresh_policydb(): returning -1");
+    return -1;
+}
+
+/**
+ * Writes a default XML policy to the policydb XML file.
+ * The default policy is empty for now.
+ * Returns: 0 on success, negative on error.
+ */
+int create_default_policy_file() {
+    int ret, fd, perms;
+    LOGW("phornyac: create_default_policy_file: entered");
+
+    /* Create the file: */
+    perms = S_IRUSR|S_IWUSR|S_IRGRP|S_IWGRP|S_IROTH|S_IWOTH;
+    fd = creat(policydb_xmlfile, perms);
+    if (fd < 0) {
+        LOGW("phornyac: create_default_policy_file: open(%s) returned "
+                "error=%d, returning -1", policydb_xmlfile,
+                errno);
+        return -1;
+    }
+
+    /* Write an "empty" policy to the file; can't just leave it blank,
+     * or subsequent XML parsing will fail. */
+    const char *empty_xml =
+        "<?xml version=\"1.0\"?>\n<policy>\n</policy>";
+    int size =
+        strlen("<?xml version=\"1.0\"?>") + 1 +
+        strlen("<policy>") + 1 +
+        strlen("</policy>");
+    LOGW("phornyac: create_default_policy_file: writing empty XML "
+            "policy of size %d to fd=%d: \n%s", size, fd, empty_xml);
+    ret = write(fd, empty_xml, size);
+    if (ret < 0) {
+        LOGW("phornyac: create_default_policy_file: write() returned "
+                "error=%d, returning -1", errno);
+        return -1;
+    } else if (ret != size) {
+        LOGW("phornyac: create_default_policy_file: write() wrote "
+                "%d of %d bytes; not an error, but treating it like "
+                "it is, returning -1", ret, size);
+        return -1;
+    }
+    
+    /* Ok, we're done: */
+    ret = close(fd);
+    if (ret < 0) {
+        LOGW("phornyac: create_default_policy_file: close(%d) returned "
+                "error=%d, returning -1", fd, errno);
+        return -1;
+    }
+    LOGW("phornyac: create_default_policy_file: successfully created "
+            "policy xml file %s", policydb_xmlfile);
+    return 0;
+}
+
 int initialize_policydb() {
     LOGW("phornyac: initialize_policydb(): entered");
     int ret;
+    struct stat st;
 
-   if (db_ptr != NULL) {
+    if (db_ptr != NULL) {
         LOGW("phornyac: initialize_policydb(): error, db_ptr pointer is "
                 "not NULL! Returning -1");
         return -1;
@@ -764,10 +821,9 @@ int initialize_policydb() {
      * http://sqlite.org/c3ref/open.html
      */
 #ifdef TESTCODE
-    struct stat db_stat;
     LOGW("phornyac: initialize_policydb(): calling stat for db_file=%s",
             db_file);
-    ret = stat(db_file, &db_stat);
+    ret = stat(db_file, &st);
     if (ret) {
         if (errno == ENOENT) {
             LOGW("phornyac: initialize_policydb(): stat returned errno=ENOENT, "
@@ -784,11 +840,16 @@ int initialize_policydb() {
     /**
      * The "standard" version of sqlite3_open() opens a database for reading
      * and writing, and creates it if it does not exist.
+     * XXX: for some reason, sqlite3_open() gets an error when it tries to
+     *   create the database file the very first time on boot. Why??
+     *   "sqlite3_open() error message: unable to open database file"
      * http://sqlite.org/c3ref/open.html
      */
     LOGW("phornyac: initialize_policydb(): calling sqlite3_open(%s)",
             db_file);
-    ret = sqlite3_open(db_file, &db_ptr);
+    //ret = sqlite3_open(db_file, &db_ptr);
+    ret = sqlite3_open_v2(db_file, &db_ptr,
+            SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE, NULL);
     if ((ret != SQLITE_OK) || (db_ptr == NULL)) {
         if (db_ptr == NULL) {
             LOGW("phornyac: initialize_policydb(): sqlite3_open() returned "
@@ -803,20 +864,33 @@ int initialize_policydb() {
     LOGW("phornyac: initialize_policydb(): sqlite3_open() succeeded, "
             "db_ptr=%p", db_ptr);
 
-    /**
-     * Create the table:
-     * See http://sqlite.org/lang_createtable.html
-     * See http://sqlite.org/c3ref/exec.html
-     */
-    LOGW("phornyac: initialize_policydb(): calling create_db_table()");
-    ret = create_db_table(db_ptr);
-    if (ret < 0) {
-        LOGW("phornyac: initialize_policydb(): create_db_table() returned "
-                "error=%d, goto close_err_exit", ret);
-        goto close_err_exit;
-   }
+    /* Check for the existence of the policy XML file, and create a
+     * blank file if it's not there: */
+    ret = stat(policydb_xmlfile, &st);
+    if (ret) {
+        if (errno == ENOENT) {
+            LOGW("phornyac: initialize_policydb(): stat returned errno=ENOENT, "
+                    "xml file does not exist yet");
+            ret = create_default_policy_file();
+            if (ret < 0) {
+                LOGW("phornyac: initialize_policydb(): "
+                        "create_default_policy_file() returned "
+                        "error=%d, goto close_err_exit", ret);
+                goto close_err_exit;
+            }
+            LOGW("phornyac: initialize_policydb(): successfully created "
+                    "policy xml file %s", policydb_xmlfile);
+        } else {
+            LOGW("phornyac: initialize_policydb(): stat returned other "
+                    "errno=%d, goto close_err_exit", errno);
+            goto close_err_exit;
+        }
+    } else {
+        LOGW("phornyac: initialize_policydb(): stat succeeded, xml file "
+                "already exists");
+    }
 
-    /* Fill in the database table from a file: */
+    /* Fill in the database table from the policy XML file: */
     LOGW("phornyac: initialize_policydb(): calling refresh_policydb() "
             "to init table");
     ret = refresh_policydb();
@@ -825,7 +899,6 @@ int initialize_policydb() {
                 "error %d, goto close_err_exit", ret);
         goto close_err_exit;
     }
-
 
     return 0;
 
