@@ -187,11 +187,20 @@ bool destination_match(const char *curDest, const char *dbDest) {
 /**
  * Returns true if the two taint tags "match," i.e. if they have any of the same
  * bits set.
+ *
+ * User either cares about specific taint (in which case he'll
+ * specify that taint in XML file), cares about ALL taint (in which case
+ * he'll use (2^32)-1 (4294967295) in the XML file), or doesn't
+ * care about taint (in which case he'll specify 0, which means
+ * we want to match this rule no matter what the current taint
+ * is). So, we count "0" as the wildcard for taint, which is convenient,
+ * because if "*" is specified for the taint rule in the XML file,
+ * it becomes 0 when sqlite stores it in the database as an integer.
  */
 bool taint_match(int curTaint, int dbTaint) {
     LOGW("phornyac: taint_match: curTaint=0x%X, dbTaint=0x%X",
             curTaint, dbTaint);
-    if (curTaint & dbTaint) {
+    if ((dbTaint == 0) || (curTaint & dbTaint)) {
         LOGW("phornyac: taint_match: returning true");
         return true;
     }
