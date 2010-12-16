@@ -56,7 +56,6 @@ const char *db_file = "/data/data/com.android.settings/policydb.db";
   /* Looks like this after sqlite3_open():
    * -rw-r--r-- root     root         3072 2010-11-14 23:07 policy.db */
 sqlite3 *db_ptr = NULL;
-sqlite3_stmt *db_query_stmt = NULL;
 
 /**
  * These constants define table structure/columns; all of the dbXyzs
@@ -97,7 +96,7 @@ const char *root_name = "rule";
  * the given source application name. Returns pointer to a newly-allocated string
  * (which should be freed by the caller) on success, or returns NULL on failure.
  */
-char *construct_querystring(const char *source) {
+char *construct_query_string(const char *source) {
     int queryLen;
     char *queryString;
     const char *select = "SELECT";
@@ -105,7 +104,7 @@ char *construct_querystring(const char *source) {
     const char *from = "FROM";
     const char *where = "WHERE";
  
-    LOGW("phornyac: construct_querystring(): entered");
+    LOGW("phornyac: construct_query_string(): entered");
     /**
      * Construct the SQL query string:
      *   SELECT *
@@ -144,7 +143,7 @@ char *construct_querystring(const char *source) {
     queryString = (char *)malloc(queryLen * sizeof(char));
     snprintf(queryString, queryLen, "%s %s %s %s %s src=\'%s\' OR src=\'*\'",
             select, columns, from, db_tablename, where, source);
-    LOGW("phornyac: construct_querystring(): queryLen=%d, queryString=%s",
+    LOGW("phornyac: construct_query_string(): queryLen=%d, queryString=%s",
             queryLen, queryString);
     return queryString;
 }
@@ -206,7 +205,7 @@ bool taint_match(int curTaint, int dbTaint) {
  * then this function should return true if the destination server and taint
  * of the data about to be transmitted BOTH match one of the records.
  */
-bool check_row_for_match(sqlite3_stmt *db_query_stmt, const char *dest, int taint) {
+bool check_row_for_match(sqlite3_stmt *db_row, const char *dest, int taint) {
     const unsigned char *dbDest;
     int dbTaint;
 
@@ -216,12 +215,12 @@ bool check_row_for_match(sqlite3_stmt *db_query_stmt, const char *dest, int tain
      * Get the values from the destination and taint tag columns:
      * http://sqlite.org/c3ref/column_blob.html
      */
-    dbDest = sqlite3_column_text(db_query_stmt, DEST);
+    dbDest = sqlite3_column_text(db_row, DEST);
     if (dbDest == NULL) {
         LOGW("phornyac: check_row_for_match(): dbDest got NULL, returning false!");
         return false;
     }
-    dbTaint = sqlite3_column_int(db_query_stmt, TAINT);
+    dbTaint = sqlite3_column_int(db_row, TAINT);
 
     /* Return true if BOTH the destinations and the taints match: */
     if (destination_match(dest, (const char *)dbDest) && taint_match(taint, dbTaint)) {
@@ -323,55 +322,109 @@ int remove_policydb_entries(policy_entry *entry) {
     return -1;
 }
 
-#ifdef TESTCODE
-#define SIIIZE 5
-const char *testfile = "/data/data/com.android.settings/files/woohoo.txt";
-#endif
-
 int query_policydb(policy_entry *entry) {
-    LOGW("phornyac: query_policydb(): not implemented yet!");
-    int taint = entry->taint_tag;
-    int ret;
+    int ret, retval;
+    int taint;
+    char *process_name;
+    char *dest_name;
+    int app_status;
+    char *query_str;
+    int query_len;
+    sqlite3_stmt *query_stmt;
+    bool match;
+    int matches;
 
-#ifdef TESTCODE
-    LOGW("phornyac: query_policydb(): checking if we can read file from RAM");
-    int fd;
-    int flags = O_RDONLY;
-    char buf[SIIIZE];
-    ret = open(testfile, flags);
-    if (ret < 0) {
-        LOGW("phornyac: query_policydb(): error opening file %s, errno=%d",
-                testfile, errno);
-    } else {
-        fd = ret;
-        ret = 1;
-        while (ret > 0) {
-            ret = read(fd, (void *)buf, SIIIZE-1);
-            if (ret < 0) {
-                LOGW("phornyac: query_policydb(): error reading file, errno=%d",
-                        errno);
-            }
-            LOGW("phornyac: query_policydb(): read %d bytes from file",
-                    ret);
-            buf[ret] = '\0';
-            LOGW("phornyac: query_policydb(): buf=\"%s\"", buf);
-        }
-        ret = close(fd);
-        if (ret < 0) {
-            LOGW("phornyac: query_policydb(): error closing file, errno=%d",
-                    errno);
+    LOGW("phornyac: query_policydb: entered");
+    retval = -1;
+    if (!db_ptr) {
+        LOGW("phornyac: query_policydb: db_ptr is NULL, returning -1");
+        retval = -1;
+        return retval;
+    }
+
+    taint = entry->taint_tag;
+    process_name = entry->process_name;
+    dest_name = entry->dest_name;
+    app_status = entry->app_status;  /* unused right now */
+
+    /* TODO: right now, we run queries that get all of the rows that
+     * match a particular source app/process name, then scan through
+     * these to check for taint/destination matches. The reason for
+     * this is so that we can run our own matching functions (that
+     * account for wildcards, subnets, etc.) on the taint and
+     * destination columns; can this be incorporated into the SELECT
+     * statement somehow?? */
+    query_str = construct_query_string(process_name);  /* free later! */
+    if (query_str == NULL) {
+        LOGW("phornyac: query_policydb: construct_query_string() returned "
+                "NULL, so returning -1");
+        retval = -1;
+        return retval;
+    }
+    LOGW("phornyac: query_policydb: construct_query_string() returned "
+            "string %s", query_str);
+    query_len = strlen(query_str);
+
+    /**
+     * Prepare the SQLite statement:
+     * http://sqlite.org/c3ref/prepare.html
+     *   (see this page for why we use query_len + 1)
+     */
+    LOGW("phornyac: query_policydb: calling sqlite3_prepare_v2()");
+    ret = sqlite3_prepare_v2(db_ptr, query_str, query_len + 1,
+            &query_stmt, NULL);
+    free(query_str);
+    if (ret != SQLITE_OK) {
+        LOGW("phornyac: query_policydb: sqlite3_prepare_v2() returned "
+                "error: %s", sqlite3_errmsg(db_ptr));
+        LOGW("phornyac: query_policydb: returning -1 due to errors");
+        retval = -1;
+        return retval;
+    }
+
+    /**
+     * Evaluate the SQL statement: call sqlite3_step() to get the next matching
+     * record, then call check_row_for_match() to see if the record matches the
+     * policy entry's destination server and taint tag. Repeat, counting the
+     * number of matches, until the statement evaluation is complete and
+     * sqlite3_step() returns SQLITE_DONE.
+     * No policy "evaluation" or "action" is taken here; we just count the
+     * matches, and it's up to the caller (policyd) what to do with that
+     * information.
+     * http://sqlite.org/c3ref/step.html
+     */
+    LOGW("phornyac: query_policydb: evaluating the statement by calling "
+            "sqlite3_step() repeatedly");
+    matches = 0;
+    ret = SQLITE_OK;
+    while (ret != SQLITE_DONE) {
+        LOGW("phornyac: query_policydb: calling sqlite3_step()");
+        ret = sqlite3_step(query_stmt);
+
+        if (ret == SQLITE_ROW) {
+            print_row(query_stmt);
+            match = check_row_for_match(query_stmt, dest_name, taint);
+            if (match) {
+                matches++;
+                LOGW("phornyac: query_policydb: found a match, incremented "
+                        "matches to %d", matches);
+           } 
+        } else if (ret != SQLITE_DONE) {
+            LOGW("phornyac: query_policydb: sqlite3_step() returned "
+                    "error: %s", sqlite3_errmsg(db_ptr));
+            LOGW("phornyac: query_policydb: returning -1 due to errors");
+            retval = -1;
+            goto finalize_and_out;
         }
     }
-#endif
 
-    if (taint) {
-        LOGW("phornyac: query_policydb(): taint is nonzero, so "
-                "returning 1 for now");
-        return 1;
-    }
-    LOGW("phornyac: query_policydb(): taint is zero, so skipping db, "
-            "just returning 0 for now");
-    return 0;
+    retval = matches;
+    LOGW("phornyac: query_policydb: sqlite3_step() returned SQLITE_DONE, "
+            "so loop completed, returning retval (matches)=%d", retval);
+finalize_and_out:
+    LOGW("phornyac: query_policydb: finalizing query_stmt and returning");
+    sqlite3_finalize(query_stmt);
+    return retval;
 }
 
 void print_xml_node(xmlTextReaderPtr reader) {
@@ -911,4 +964,128 @@ close_err_exit:
     LOGW("phornyac: initialize_policydb(): returning -1");
     return -1;
 }
+
+#if 0
+#ifdef TESTCODE
+#define SIIIZE 5
+const char *testfile = "/data/data/com.android.settings/files/woohoo.txt";
+#endif
+#endif
+
+#if 0
+/**
+ * Constructs a query string that gets the records/rows of the database matching
+ * the given source application name. Returns pointer to a newly-allocated string
+ * (which should be freed by the caller) on success, or returns NULL on failure.
+ */
+char *construct_querystring_from_source(const char *source) {
+    int queryLen;
+    char *queryString;
+    const char *select = "SELECT";
+    const char *columns = "*";
+    const char *from = "FROM";
+    const char *where = "WHERE";
+ 
+    LOGW("phornyac: construct_querystring(): entered");
+    /**
+     * Construct the SQL query string:
+     *   SELECT *
+     *     FROM <table_name>
+     *     WHERE src='<source>'
+     * Wildcards: ??
+     * Impt: taint may not match exactly!
+     *   So, use the callback function for each gotten record to AND the taint
+     *   from the database record with the current data taint! This means that
+     *   we will "match" if any bit in current data taint tag matches any bit in
+     *   taint tag stored in database.
+     *     Do this for destination too???? Yes!
+     *       So, just WHERE on the source!
+     * http://www.w3schools.com/sql/sql_select.asp
+     * http://www.w3schools.com/sql/sql_where.asp
+     *   Use single quotes, i.e. SELECT * FROM Persons WHERE FirstName='Tove'
+     * http://www.w3schools.com/sql/sql_and_or.asp
+     */
+
+    //XXX: should sanitize input to this function, or risk SQL injection attack!
+
+    /**
+     * Examples: http://www.sqlite.org/lang_expr.html
+     *   SELECT * FROM policy WHERE src='com.android.browser'
+     *     Get rows for source app com.android.browser
+     *   SELECT * FROM policy WHERE src LIKE '%'
+     *     Get all rows
+     *   SELECT * FROM policy WHERE src='com.android.browser' OR src='*'
+     *     Get rows for source app com.android.browser and for global policy
+     *     that applies to all source apps
+     */
+    queryLen = strlen(select) + strlen(" ") + strlen(columns) + 
+        strlen(" ") + strlen(from) +
+        strlen(" ") + strlen(db_tablename) + strlen(" ") + strlen(where) +
+        strlen(" src=\'") + strlen(source) + strlen("\' OR src=\'*\'") + 1;
+    queryString = (char *)malloc(queryLen * sizeof(char));
+    snprintf(queryString, queryLen, "%s %s %s %s %s src=\'%s\' OR src=\'*\'",
+            select, columns, from, db_tablename, where, source);
+    LOGW("phornyac: construct_querystring(): queryLen=%d, queryString=%s",
+            queryLen, queryString);
+    return queryString;
+}
+#endif
+#if 0
+    LOGW("phornyac: query_policydb(): checking if we can read file from RAM");
+    int fd;
+    int flags = O_RDONLY;
+    char buf[SIIIZE];
+    ret = open(testfile, flags);
+    if (ret < 0) {
+        LOGW("phornyac: query_policydb(): error opening file %s, errno=%d",
+                testfile, errno);
+    } else {
+        fd = ret;
+        ret = 1;
+        while (ret > 0) {
+            ret = read(fd, (void *)buf, SIIIZE-1);
+            if (ret < 0) {
+                LOGW("phornyac: query_policydb(): error reading file, errno=%d",
+                        errno);
+            }
+            LOGW("phornyac: query_policydb(): read %d bytes from file",
+                    ret);
+            buf[ret] = '\0';
+            LOGW("phornyac: query_policydb(): buf=\"%s\"", buf);
+        }
+        ret = close(fd);
+        if (ret < 0) {
+            LOGW("phornyac: query_policydb(): error closing file, errno=%d",
+                    errno);
+        }
+    }
+#endif
+
+#if 0
+if (taint) {
+        LOGW("phornyac: query_policydb(): taint is nonzero, but still "
+                "returning 0 for now");
+        return 0;
+    }
+    LOGW("phornyac: query_policydb(): taint is zero, so skipping db, "
+            "just returning 0 for now");
+#endif
+                //Old code: we don't do true/false here anymore
+#if 0
+                /**
+                 * If the default policy is to allow data transmission, then
+                 * when there is a matching record in the policy database we
+                 * should block the transmission, and vice-versa:
+                 */
+                if (defaultAllow) {
+                    LOGW("phornyac: query_policydb: found a match, setting "
+                            "retval=false");
+                    retval = false;
+                } else {
+                    LOGW("phornyac: query_policydb: found a match, setting "
+                            "retval=true");
+                    retval = true;
+                }
+                goto finalize_and_out;
+#endif
 
