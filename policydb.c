@@ -104,7 +104,7 @@ char *construct_query_string(const char *source) {
     const char *from = "FROM";
     const char *where = "WHERE";
  
-    LOGW("phornyac: construct_query_string(): entered");
+    //LOGW("phornyac: construct_query_string(): entered");
     /**
      * Construct the SQL query string:
      *   SELECT *
@@ -143,8 +143,8 @@ char *construct_query_string(const char *source) {
     queryString = (char *)malloc(queryLen * sizeof(char));
     snprintf(queryString, queryLen, "%s %s %s %s %s src=\'%s\' OR src=\'*\'",
             select, columns, from, db_tablename, where, source);
-    LOGW("phornyac: construct_query_string(): queryLen=%d, queryString=%s",
-            queryLen, queryString);
+    //LOGW("phornyac: construct_query_string(): queryLen=%d, queryString=%s",
+    //        queryLen, queryString);
     return queryString;
 }
 
@@ -218,7 +218,7 @@ bool check_row_for_match(sqlite3_stmt *db_row, const char *dest, int taint) {
     const unsigned char *dbDest;
     int dbTaint;
 
-    LOGW("phornyac: check_row_for_match(): entered");
+    //LOGW("phornyac: check_row_for_match(): entered");
 
     /**
      * Get the values from the destination and taint tag columns:
@@ -233,10 +233,10 @@ bool check_row_for_match(sqlite3_stmt *db_row, const char *dest, int taint) {
 
     /* Return true if BOTH the destinations and the taints match: */
     if (destination_match(dest, (const char *)dbDest) && taint_match(taint, dbTaint)) {
-        LOGW("phornyac: check_row_for_match(): returning true");
+        //LOGW("phornyac: check_row_for_match(): returning true");
         return true;
     }
-    LOGW("phornyac: check_row_for_match(): returning false");
+    //LOGW("phornyac: check_row_for_match(): returning false");
     return false;
 }
 
@@ -343,7 +343,7 @@ int query_policydb(policy_entry *entry) {
     bool match;
     int matches;
 
-    LOGW("phornyac: query_policydb: entered");
+    //LOGW("phornyac: query_policydb: entered");
     retval = -1;
     if (!db_ptr) {
         LOGW("phornyac: query_policydb: db_ptr is NULL, returning -1");
@@ -379,7 +379,7 @@ int query_policydb(policy_entry *entry) {
      * http://sqlite.org/c3ref/prepare.html
      *   (see this page for why we use query_len + 1)
      */
-    LOGW("phornyac: query_policydb: calling sqlite3_prepare_v2()");
+    //LOGW("phornyac: query_policydb: calling sqlite3_prepare_v2()");
     ret = sqlite3_prepare_v2(db_ptr, query_str, query_len + 1,
             &query_stmt, NULL);
     free(query_str);
@@ -402,12 +402,12 @@ int query_policydb(policy_entry *entry) {
      * information.
      * http://sqlite.org/c3ref/step.html
      */
-    LOGW("phornyac: query_policydb: evaluating the statement by calling "
-            "sqlite3_step() repeatedly");
+    //LOGW("phornyac: query_policydb: evaluating the statement by calling "
+    //        "sqlite3_step() repeatedly");
     matches = 0;
     ret = SQLITE_OK;
     while (ret != SQLITE_DONE) {
-        LOGW("phornyac: query_policydb: calling sqlite3_step()");
+        //LOGW("phornyac: query_policydb: calling sqlite3_step()");
         ret = sqlite3_step(query_stmt);
 
         if (ret == SQLITE_ROW) {
@@ -428,10 +428,10 @@ int query_policydb(policy_entry *entry) {
     }
 
     retval = matches;
-    LOGW("phornyac: query_policydb: sqlite3_step() returned SQLITE_DONE, "
-            "so loop completed, returning retval (matches)=%d", retval);
+    //LOGW("phornyac: query_policydb: sqlite3_step() returned SQLITE_DONE, "
+    //        "so loop completed, returning retval (matches)=%d", retval);
 finalize_and_out:
-    LOGW("phornyac: query_policydb: finalizing query_stmt and returning");
+    //LOGW("phornyac: query_policydb: finalizing query_stmt and returning");
     sqlite3_finalize(query_stmt);
     return retval;
 }
