@@ -49,6 +49,10 @@
 # endif
 #endif
 
+/* Set to true to use character hostnames, rather than numerical
+ * IP addresses, for matching the policy entries. */
+static bool USE_HOSTNAME = true;
+
 /**
  * Persistent variables for storing SQLite database connection, etc.
  */
@@ -180,7 +184,31 @@ bool destination_match(const char *curDest, const char *dbDest) {
         LOGW("phornyac: destination_match: returning true");
         return true;
     }
-    LOGW("phornyac: destination_match: returning false");
+    //LOGW("phornyac: destination_match: returning false");
+    return false;
+}
+
+/**
+ * Returns true if the two destination hostnames match, or if the
+ * destination stored in the database row is the wildcard "*". A
+ * destination hostname matches the database (exposure policy)
+ * hostname if the db hostname is a substring of the destination
+ * hostname (case-insensitive). If the destination hostname is
+ * NULL, then this does not count as a match.
+ */
+bool hostname_match(const char *curDest, const char *dbDest) {
+    LOGW("phornyac: hostname_match: curDest=%s, dbDest=%s",
+            curDest, dbDest);
+    if (curDest == NULL)
+        return false;
+
+    /* strcasestr() returns pointer to first occurrence of arg2 in 
+     * arg1, or NULL if not found. */
+    if ((strcmp("*", dbDest) == 0) ||
+        (strcasestr(curDest, dbDest) != NULL)) {
+        LOGW("phornyac: hostname_match: returning true");
+        return true;
+    }
     return false;
 }
 
@@ -217,6 +245,7 @@ bool taint_match(int curTaint, int dbTaint) {
 bool check_row_for_match(sqlite3_stmt *db_row, const char *dest, int taint) {
     const unsigned char *dbDest;
     int dbTaint;
+    bool match = false;
 
     //LOGW("phornyac: check_row_for_match(): entered");
 
@@ -232,12 +261,14 @@ bool check_row_for_match(sqlite3_stmt *db_row, const char *dest, int taint) {
     dbTaint = sqlite3_column_int(db_row, TAINT);
 
     /* Return true if BOTH the destinations and the taints match: */
-    if (destination_match(dest, (const char *)dbDest) && taint_match(taint, dbTaint)) {
-        //LOGW("phornyac: check_row_for_match(): returning true");
-        return true;
+    if (USE_HOSTNAME) {
+        match = (hostname_match(dest, (const char *)dbDest) &&
+                 taint_match(taint, dbTaint));
+    } else {
+        match = (destination_match(dest, (const char *)dbDest) &&
+                 taint_match(taint, dbTaint));
     }
-    //LOGW("phornyac: check_row_for_match(): returning false");
-    return false;
+    return match;
 }
 
 /**
@@ -336,6 +367,7 @@ int query_policydb(policy_entry *entry) {
     int taint;
     char *process_name;
     char *dest_name;
+    char *hostname;
     int app_status;
     char *query_str;
     int query_len;
@@ -354,6 +386,7 @@ int query_policydb(policy_entry *entry) {
     taint = entry->taint_tag;
     process_name = entry->process_name;
     dest_name = entry->dest_name;
+    hostname = entry->hostname;
     app_status = entry->app_status;  /* unused right now */
 
     /* TODO: right now, we run queries that get all of the rows that
@@ -412,7 +445,10 @@ int query_policydb(policy_entry *entry) {
 
         if (ret == SQLITE_ROW) {
             print_row(query_stmt);
-            match = check_row_for_match(query_stmt, dest_name, taint);
+            if (USE_HOSTNAME)
+                match = check_row_for_match(query_stmt, hostname, taint);
+            else
+                match = check_row_for_match(query_stmt, dest_name, taint);
             if (match) {
                 matches++;
                 LOGW("phornyac: query_policydb: found a match, incremented "
