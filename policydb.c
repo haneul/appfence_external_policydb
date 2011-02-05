@@ -242,7 +242,8 @@ bool taint_match(int curTaint, int dbTaint) {
  * then this function should return true if the destination server and taint
  * of the data about to be transmitted BOTH match one of the records.
  */
-bool check_row_for_match(sqlite3_stmt *db_row, const char *dest, int taint) {
+bool check_row_for_match(sqlite3_stmt *db_row, const char *process_name, 
+        const char *dest, int taint) {
     const unsigned char *dbDest;
     int dbTaint;
     bool match = false;
@@ -267,6 +268,16 @@ bool check_row_for_match(sqlite3_stmt *db_row, const char *dest, int taint) {
     } else {
         match = (destination_match(dest, (const char *)dbDest) &&
                  taint_match(taint, dbTaint));
+    }
+    if (match) {
+        LOGW("phornyac: check_row_for_match: MATCHED process_name=[%s], "
+                "hostname=[%s], db_name=[%s], taint-tag=[0x%X]",
+                process_name, dest, dbDest, taint);
+    } else {
+        //This will cause pretty heavy logging:
+        LOGW("phornyac: check_row_for_match: no-match process_name=[%s], "
+                "hostname=[%s], db_name=[%s], taint-tag=[0x%X]",
+                process_name, dest, dbDest, taint);
     }
     return match;
 }
@@ -444,11 +455,13 @@ int query_policydb(policy_entry *entry) {
         ret = sqlite3_step(query_stmt);
 
         if (ret == SQLITE_ROW) {
-            print_row(query_stmt);
+            //print_row(query_stmt);
             if (USE_HOSTNAME)
-                match = check_row_for_match(query_stmt, hostname, taint);
+                match = check_row_for_match(query_stmt,
+                        (const char *)process_name, hostname, taint);
             else
-                match = check_row_for_match(query_stmt, dest_name, taint);
+                match = check_row_for_match(query_stmt,
+                        (const char *)process_name, dest_name, taint);
             if (match) {
                 matches++;
                 LOGW("phornyac: query_policydb: found a match, incremented "
